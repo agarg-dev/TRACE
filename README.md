@@ -2,6 +2,8 @@
 
 This repository contains the implementation of TRACE (Temporal Risk Assessment and Concept Editing). TRACE learns a discrete codebook from language-model activations, uses the learned concepts for streaming harmfulness detection, and steers activations along harmful-to-benign concept directions during generation.
 
+This work was accepted at the [2026 Symposium on Model Accountability, Sustainability and Healthcare (SMASH)](https://smashcon.org/en/). The extended abstract is available [here](Ankur_Garg_SmashCon.pdf).
+
 ## Repository structure
 
 ```text
@@ -132,3 +134,17 @@ bash scripts/analysis/concept_audit.sh
 ```
 
 The paper uses three independently sampled labeling runs with seeds 42, 43, and 44, followed by semantic agreement across the three runs.
+
+## Citation
+
+If you find this work useful or use it in your research, please cite:
+
+```bibtex
+@misc{garg2026trace,
+  title  = {{TRACE}: Temporal Risk Assessment and Concept Editing for Safer Language Generation},
+  author = {Garg, Ankur and Yu, Xuemin and Sajjad, Hassan and Ebrahimi Kahou, Samira},
+  year   = {2026},
+  note   = {Accepted at the Symposium on Model Accountability, Sustainability and Healthcare (SMASH 2026)},
+  url    = {https://github.com/agarg-dev/TRACE}
+}
+```
