@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""Generate matched unsteered and TRACE-steered responses."""
+"""Generate unsteered and TRACE-steered responses."""
 
 import argparse
+from dataclasses import dataclass
 import json
 import time
 from pathlib import Path
@@ -15,18 +16,12 @@ from analysis.concept_audit import (
     append_steering_cache,
     initialize_steering_cache,
 )
-from activations.activation_cache import load_activation_sequences, resolve_activation_cache
-from data.dataset_splits import (
-    DETECTOR_TRAIN_SET_BY_DATASET,
-    evaluation_split,
-    train_validation_split,
-    training_split,
-)
+from activations.cache import load_activation_sequences
+from data.dataset_splits import DEFAULT_DATASET, evaluation_split, train_validation_split, training_split
 from model_inputs import (
-    configure_transformers_compatibility, format_prompt_token_ids, initialize_internlm3_rotary_embeddings,
+    restore_transformers_loss_kwargs, format_prompt_token_ids, repair_internlm3_rotary_embeddings,
 )
-from project_config import DEFAULT_BASE_MODEL, DEFAULT_DATASET, READ_LAYER
-from project_config import base_model_path, resolve_project_path
+from project_config import DEFAULT_BASE_MODEL, MODEL_DIR, READ_LAYER
 from vq.codebook import (
     assign_codes_for_sequences,
     encode_and_assign_activations,
@@ -37,101 +32,119 @@ from vq.codebook import (
 from vq.model import load_steering_vq_checkpoint
 
 
-METHODS = ("additive_renorm_gate", "additive_gate", "additive_renorm")
-RECIPE_PREFIX = "euclid"
+BASE_METHODS = ("additive", "ablation", "clamp")
+METHOD_MODIFIERS = ("", "_renorm", "_gate", "_renorm_gate")
+ALL_METHODS = tuple(method + modifier for method in BASE_METHODS for modifier in METHOD_MODIFIERS)
+COUNTERPART_SELECTIONS = {
+    "fixed": "euclid",
+    "activation_nearest": "activation_nearest",
+}
 
 
-def nearest_benign_code_pairs(codebook, harmful_codes, benign_codes):
+@dataclass(frozen=True)
+class SteeringTargets:
+    """Code regions, edit vectors, scores, and benign candidates used for steering."""
+
+    harmful_codes: list[int]
+    concept_vectors: torch.Tensor
+    fixed_counterparts: torch.Tensor
+    harmful_scores: torch.Tensor
+    reliable_benign_codes: torch.Tensor
+
+
+def nearest_benign_code_pairs(codebook, harmful_codes, device, benign_codes=None):
     """Return one nearest eligible benign code for every harmful code."""
-    benign_codes = torch.as_tensor(benign_codes, dtype=torch.long, device=codebook.device)
-    if not len(benign_codes):
-        raise ValueError("at least one eligible benign code is required")
+    harmful_set = set(harmful_codes)
+    if benign_codes is None:
+        benign_codes = [code for code in range(codebook.shape[0]) if code not in harmful_set]
+    benign_codes = torch.as_tensor(benign_codes, dtype=torch.long, device=device)
     benign_vectors = codebook[benign_codes]
-    counterparts = torch.arange(codebook.shape[0], dtype=torch.long, device=codebook.device)
+    counterparts = torch.arange(codebook.shape[0], dtype=torch.long, device=device)
     for harmful_code in harmful_codes:
         nearest_benign = ((codebook[harmful_code] - benign_vectors) ** 2).sum(1).argmin()
         counterparts[harmful_code] = benign_codes[nearest_benign]
     return counterparts
 
 
-def build_steering_targets(transcoder, num_codes, device, training_cache, read_layer,
-                           prior_strength, min_benign_response_support=10):
-    """Build harmful codes, activation-space edit vectors, and benign counterparts."""
+def build_steering_targets(transcoder, num_codes, device, concept="code_mean", training_cache=None,
+                           read_layer=READ_LAYER, prior_strength=None, min_benign_response_support=10):
+    """Build harmful codes, edit vectors, fixed pairs, scores, and reliable benign candidates.
+
+    ``codebook`` uses the trained code vectors. ``code_mean`` uses each code's mean training activation in
+    the activation space where the edit acts. Code assignment always stays on the trained codebook.
+    """
+    # Match the nested VQ split when estimating concept means and response support.
     split_seed = int(transcoder.checkpoint_config.get("seed", 42))
     all_training_sequences = load_activation_sequences(training_cache, read_layer)
-    if transcoder.checkpoint_config.get("split_scheme") != "nested_90_5_5":
-        raise ValueError("TRACE steering requires a checkpoint trained with the nested split")
     detector_training, _ = train_validation_split(all_training_sequences, split_seed)
     training_sequences, _ = train_validation_split(detector_training, split_seed)
+
     assignments = assign_codes_for_sequences(
         transcoder, training_sequences, device, assignment_space="encoded_activation"
     )
     response_assignments = split_assignments_by_response(training_sequences, assignments)
     labels = [sequence["label"] for sequence in training_sequences]
+    if prior_strength is None:
+        prior_strength = transcoder.checkpoint_config.get("code_score_prior_strength", 10.0)
 
-    saved_regions = transcoder.checkpoint_regions or {}
-    saved_harmfulness = saved_regions.get("signed_harmfulness")
-    score_method = saved_regions.get("score_method")
-    if score_method != "response_presence":
-        raise ValueError("TRACE steering requires response-presence code scores in the VQ checkpoint")
-    saved_prior = float(saved_regions.get("prior_strength", prior_strength))
-    saved_region_matches = np.isclose(saved_prior, prior_strength)
-    has_saved_scores = saved_regions.get("harmful_codes") and saved_harmfulness is not None
-    if has_saved_scores and not saved_region_matches:
-        raise ValueError(
-            f"the checkpoint's stored code score uses prior strength {saved_prior:g}, but "
-            f"{prior_strength:g} was requested"
-        )
-    if not has_saved_scores:
-        raise ValueError("the VQ checkpoint does not contain harmfulness scores for steering")
-    harmful_codes = saved_regions["harmful_codes"]
-    harmful_scores = np.clip(np.asarray(saved_harmfulness), 0.0, None)
+    harmful_codes = transcoder.checkpoint_regions["harmful_codes"]
+    harmful_scores = np.clip(
+        np.asarray(transcoder.checkpoint_regions["signed_harmfulness"]), 0.0, None
+    )
 
+    # A benign target must occur in enough training responses to have a stable mean.
     response_statistics = smoothed_response_code_statistics(
         response_assignments, labels, num_codes, prior_strength
     )
     harmful_code_set = set(harmful_codes)
-    reliable_benign_codes = [
-        code for code, support in enumerate(response_statistics["response_counts"])
-        if code not in harmful_code_set and support >= min_benign_response_support
-    ]
-    if not reliable_benign_codes:
-        raise ValueError(
-            "no benign code meets the minimum response-support requirement; "
-            "lower --min-benign-response-support"
-        )
+    reliable_benign_codes = []
+    for code, support in enumerate(response_statistics["response_counts"]):
+        if code in harmful_code_set:
+            continue
+        if support >= min_benign_response_support:
+            reliable_benign_codes.append(code)
 
-    activation_dimension = training_sequences[0]["x"].shape[1]
-    code_means = torch.zeros(num_codes, activation_dimension, dtype=torch.float32)
-    code_counts = torch.zeros(num_codes, dtype=torch.float32)
-    assignment_start = 0
-    for sequence in training_sequences:
-        assignment_end = assignment_start + len(sequence["x"])
-        sequence_assignments = torch.from_numpy(assignments[assignment_start:assignment_end])
-        sequence_activations = sequence["x"].float()
-        code_means.index_add_(0, sequence_assignments, sequence_activations)
-        code_counts.index_add_(0, sequence_assignments, torch.ones(len(sequence_assignments)))
-        assignment_start = assignment_end
-    concept_vectors = (code_means / code_counts.clamp(min=1).unsqueeze(1)).to(device)
-    unused_codes = code_counts.to(device) == 0
-    concept_vectors[unused_codes] = transcoder.quantizer.codebook.detach().to(device)[unused_codes]
+    # Steering acts in residual-stream space, so use each concept's mean activation.
+    concept_vectors = transcoder.quantizer.codebook.detach().to(device)
+    if concept == "code_mean":
+        activation_dimension = training_sequences[0]["x"].shape[1]
+        code_means = torch.zeros(num_codes, activation_dimension, dtype=torch.float32)
+        code_counts = torch.zeros(num_codes, dtype=torch.float32)
+        assignment_start = 0
+
+        for sequence in training_sequences:
+            assignment_end = assignment_start + len(sequence["x"])
+            sequence_assignments = torch.from_numpy(assignments[assignment_start:assignment_end])
+            sequence_activations = sequence["x"].float()
+            code_means.index_add_(0, sequence_assignments, sequence_activations)
+            code_counts.index_add_(0, sequence_assignments, torch.ones(len(sequence_assignments)))
+            assignment_start = assignment_end
+
+        code_means = (code_means / code_counts.clamp(min=1).unsqueeze(1)).to(device)
+        unused_codes = code_counts.to(device) == 0
+        code_means[unused_codes] = concept_vectors[unused_codes]
+        concept_vectors = code_means
 
     harmful_scores = torch.tensor(harmful_scores, dtype=torch.float32, device=device)
     reliable_benign_codes = torch.tensor(reliable_benign_codes, dtype=torch.long, device=device)
     fixed_counterparts = nearest_benign_code_pairs(
-        concept_vectors, harmful_codes, reliable_benign_codes
+        concept_vectors, harmful_codes, device, benign_codes=reliable_benign_codes
     )
-    return harmful_codes, concept_vectors, fixed_counterparts, harmful_scores, reliable_benign_codes
+    return SteeringTargets(
+        harmful_codes=harmful_codes,
+        concept_vectors=concept_vectors,
+        fixed_counterparts=fixed_counterparts,
+        harmful_scores=harmful_scores,
+        reliable_benign_codes=reliable_benign_codes,
+    )
 
 
 def normalized_gate_weights(harmful_scores, harmful_codes):
-    """Map one canonical signed score to steering weights without changing its code ordering."""
+    """Map the stored signed scores to steering weights without changing code order."""
     gate_weights = torch.zeros_like(harmful_scores)
     harmful_indices = torch.as_tensor(harmful_codes, dtype=torch.long, device=harmful_scores.device)
     positive_scores = harmful_scores[harmful_indices].clamp(min=0)
-    maximum_score = positive_scores.max() if len(positive_scores) else harmful_scores.new_tensor(0.0)
-    if maximum_score <= 0:
-        raise ValueError("harmful codes must include at least one positive harmfulness score")
+    maximum_score = positive_scores.max()
     gate_weights[harmful_indices] = positive_scores / maximum_score
     return gate_weights
 
@@ -153,15 +166,21 @@ class ActivationSteerer:
     """Forward hook that edits harmful-coded token activations toward benign targets."""
 
     def __init__(self, transcoder, harmful_codes, concept_vectors, counterparts, harmful_weights,
-                 device, capture_trace=False):
+                 reliable_benign_codes, counterpart_selection, device, capture_trace=False):
         self.transcoder = transcoder
         self.concept_vectors = concept_vectors
         self.counterparts = counterparts
         self.harmful_weights = harmful_weights
-        self.capture_trace = capture_trace
-        self.harmful_code_ids = torch.tensor(harmful_codes, device=device)
-        self.lam, self.method, self.active = 0.0, None, True
-        self.renorm, self.gate = False, False
+        self.reliable_benign_codes = reliable_benign_codes
+        self.counterpart_selection = counterpart_selection
+        self.capture_trace = bool(capture_trace)
+        self.harmful_code_tensor = torch.tensor(harmful_codes, device=device)
+        self.strength = 0.0
+        self.method = None
+        self.active = True
+        self.base_method = None
+        self.preserve_norm = False
+        self.weight_by_harmfulness = False
         self.reset()
 
     def reset(self):
@@ -170,12 +189,15 @@ class ActivationSteerer:
         self.assigned_code_steps = []
         self.target_code_steps = []
 
-    def configure(self, lam, method):
-        self.lam, self.method = lam, method
+    def configure(self, strength, method):
+        self.strength = strength
+        self.method = method
         if method is not None:
-            self.renorm, self.gate = "renorm" in method, "gate" in method
+            self.base_method = method.split("_", 1)[0]
+            self.preserve_norm = "renorm" in method
+            self.weight_by_harmfulness = "gate" in method
 
-    def __call__(self, _module, _inputs, output):
+    def __call__(self, module, inputs, output):
         if not self.active:
             return output
         self.calls += 1
@@ -184,28 +206,68 @@ class ActivationSteerer:
 
         hidden_states = output[0] if isinstance(output, tuple) else output
         current_activations = hidden_states[:, -1, :].float()
-        _, codes = encode_and_assign_activations(self.transcoder, current_activations)
-        fired = torch.isin(codes, self.harmful_code_ids)
-        self.fire_steps.append(fired.detach().cpu())
+
+        # Assign the newest token and edit only harmful concepts.
+        encoded_activations, codes = encode_and_assign_activations(self.transcoder, current_activations)
+        edit_mask = torch.isin(codes, self.harmful_code_tensor)
+        self.fire_steps.append(edit_mask.detach().cpu())
         target_codes = torch.full_like(codes, -1)
 
-        if fired.any():
-            harmful_codes = codes[fired]
-            fired_activations = current_activations[fired]
+        if edit_mask.any():
+            harmful_codes = codes[edit_mask]
+            edited_activations = current_activations[edit_mask]
             harmful_vectors = self.concept_vectors[harmful_codes]
-            benign_codes = self.counterparts[harmful_codes]
-            target_codes[fired] = benign_codes
+
+            # Choose the fixed benign counterpart or the nearest target for this activation.
+            if self.counterpart_selection == "activation_nearest":
+                edited_encoded = encoded_activations[edit_mask]
+                candidate_vectors = self.transcoder.quantizer.codebook[self.reliable_benign_codes]
+                candidate_distances = (
+                    edited_encoded.pow(2).sum(1, keepdim=True)
+                    - 2 * edited_encoded @ candidate_vectors.t()
+                    + candidate_vectors.pow(2).sum(1)
+                )
+                benign_codes = self.reliable_benign_codes[candidate_distances.argmin(1)]
+            else:
+                benign_codes = self.counterparts[harmful_codes]
+
+            target_codes[edit_mask] = benign_codes
             benign_vectors = self.concept_vectors[benign_codes]
             direction = benign_vectors - harmful_vectors
-            gate_weight = self.harmful_weights[harmful_codes].unsqueeze(-1) if self.gate else 1.0
-            if self.renorm:
+
+            edit_weight = 1.0
+            if self.weight_by_harmfulness:
+                edit_weight = self.harmful_weights[harmful_codes].unsqueeze(-1)
+
+            # Norm-preserving addition rotates the activation toward the edit direction.
+            if self.base_method == "additive" and self.preserve_norm:
                 steered = spherical_interpolate_direction(
-                    fired_activations, direction, self.lam * gate_weight
+                    edited_activations, direction, self.strength * edit_weight
                 )
             else:
-                steered = fired_activations + self.lam * direction * gate_weight
-            fired_rows = fired.nonzero(as_tuple=True)[0]
-            hidden_states[fired_rows, -1, :] = steered.to(hidden_states.dtype)
+                if self.base_method == "additive":
+                    edit = self.strength * direction
+                else:
+                    harmful_axis = -direction / (direction.norm(dim=-1, keepdim=True) + 1e-6)
+                    projected = edited_activations
+                    if self.base_method == "clamp":
+                        projected = edited_activations - benign_vectors
+                    edit = (
+                        -self.strength
+                        * (projected * harmful_axis).sum(-1, keepdim=True)
+                        * harmful_axis
+                    )
+                steered = edited_activations + edit * edit_weight
+
+                if self.preserve_norm:
+                    original_norm = edited_activations.norm(dim=-1, keepdim=True)
+                    steered = steered * (
+                        original_norm / (steered.norm(dim=-1, keepdim=True) + 1e-6)
+                    )
+
+            edited_rows = edit_mask.nonzero(as_tuple=True)[0]
+            hidden_states[edited_rows, -1, :] = steered.to(hidden_states.dtype)
+
         if self.capture_trace:
             self.assigned_code_steps.append(codes.detach().cpu())
             self.target_code_steps.append(target_codes.detach().cpu())
@@ -216,18 +278,29 @@ class ActivationSteerer:
 def generate_batch(model, tokenizer, prompts, steerer, max_new_tokens):
     """Greedily generate a batch with the steering hook active and return edit metadata."""
     steerer.reset()
-    padding_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    padding_token_id = tokenizer.pad_token_id
+    if padding_token_id is None:
+        padding_token_id = tokenizer.eos_token_id
+
     encoded_prompts = [format_prompt_token_ids(tokenizer, prompt) for prompt in prompts]
     max_prompt_length = max(len(tokens) for tokens in encoded_prompts)
-    input_ids = torch.tensor([
-        [padding_token_id] * (max_prompt_length - len(tokens)) + tokens for tokens in encoded_prompts
-    ], device=model.device)
-    attention_mask = torch.tensor([
-        [0] * (max_prompt_length - len(tokens)) + [1] * len(tokens) for tokens in encoded_prompts
-    ], device=model.device)
-    generated = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens,
-                               do_sample=False, pad_token_id=padding_token_id)
-    texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in generated[:, max_prompt_length:]]
+
+    padded_prompts = []
+    prompt_masks = []
+    for tokens in encoded_prompts:
+        padding_length = max_prompt_length - len(tokens)
+        padded_prompts.append([padding_token_id] * padding_length + tokens)
+        prompt_masks.append([0] * padding_length + [1] * len(tokens))
+
+    input_ids = torch.tensor(padded_prompts, device=model.device)
+    attention_mask = torch.tensor(prompt_masks, device=model.device)
+    generated = model.generate(
+        input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens,
+        do_sample=False, pad_token_id=padding_token_id,
+    )
+
+    response_tokens = generated[:, max_prompt_length:]
+    texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens in response_tokens]
     fired_counts, generated_lengths = edits_per_prompt(steerer, texts, tokenizer)
     traces = steering_traces_per_prompt(steerer, generated_lengths)
     return texts, fired_counts, generated_lengths, traces
@@ -284,18 +357,19 @@ def response_nll(model, final_hidden_states, input_ids, response_start, chunk_si
 
 
 @torch.no_grad()
-def score_response(model, tokenizer, transcoder, prompt, generated_text, read_layer):
-    """Measure response NLL and assign output tokens to concepts."""
+def score_response(model, tokenizer, transcoder, harmful_codes, prompt, generated_text, read_layer):
+    """Score harmful-code rate and base-model NLL with the steering hook disabled."""
     response_token_ids = tokenizer(generated_text, add_special_tokens=False)["input_ids"]
     if not response_token_ids:
-        return None, [], []
+        return None, None, [], []
     prompt_token_ids = format_prompt_token_ids(tokenizer, prompt)
     input_ids = torch.tensor([prompt_token_ids + response_token_ids], device=model.device)
     model_output = model.model(input_ids, output_hidden_states=True, use_cache=False)
     read_layer_activations = model_output.hidden_states[read_layer]
     codes = nearest_code_indices(transcoder, read_layer_activations[0, len(prompt_token_ids):, :].float())
+    harmful_code_rate = float(torch.isin(codes, harmful_codes).float().mean())
     mean_nll = response_nll(model, model_output.last_hidden_state, input_ids, len(prompt_token_ids))
-    return mean_nll, response_token_ids, codes.cpu().tolist()
+    return harmful_code_rate, mean_nll, response_token_ids, codes.cpu().tolist()
 
 
 def non_repetition_score(text):
@@ -306,27 +380,46 @@ def non_repetition_score(text):
 
 
 def process_batch(model, tokenizer, transcoder, steerer, batch, lams, max_new_tokens, methods,
-                  read_layer, prompt_id_key):
+                  recipe_prefix, read_layer, prompt_id_key):
     """Generate and score the baseline plus every method/lambda pair for one prompt batch."""
     prompts = [row["prompt"] for row in batch]
-    records = [{"idx": row[prompt_id_key], "label": row["label"], "prompt": row["prompt"],
-                "baseline": None, "steered": {}} for row in batch]
+    records = []
+    for row in batch:
+        records.append({
+            "idx": row[prompt_id_key],
+            "label": row["label"],
+            "prompt": row["prompt"],
+            "baseline": None,
+            "steered": {},
+        })
+
     audit_rows = []
     configurations = [(None, 0.0)] + [(method, lam) for method in methods for lam in lams]
+
     for method, lam in configurations:
+        # Generate one matched output for each prompt under this steering setting.
         steerer.configure(lam, method)
         texts, fired_counts, generated_lengths, traces = generate_batch(
             model, tokenizer, prompts, steerer, max_new_tokens
         )
+
+        # Score the generated text with no intervention active.
         steerer.active = False
-        scores = [score_response(model, tokenizer, transcoder, prompt, text, read_layer)
-                  for prompt, text in zip(prompts, texts)]
+        scores = []
+        for prompt, text in zip(prompts, texts):
+            scores.append(score_response(
+                model, tokenizer, transcoder, steerer.harmful_code_tensor,
+                prompt, text, read_layer,
+            ))
         steerer.active = True
+
+        # Store output quality, concept rate, and optional per-token audit records.
         for index, text in enumerate(texts):
-            mean_nll, token_ids, output_code_ids = scores[index]
+            harmful_code_rate, mean_nll, token_ids, output_code_ids = scores[index]
             non_repetition = non_repetition_score(text)
             cell = {
                 "text": text,
+                "rate": harmful_code_rate,
                 "non_repetition": non_repetition,
                 "base_model_nll": round(mean_nll, 4) if mean_nll is not None else None,
             }
@@ -336,18 +429,26 @@ def process_batch(model, tokenizer, transcoder, steerer, batch, lams, max_new_to
                 result_key = "baseline"
             else:
                 baseline_nll = records[index]["baseline"]["base_model_nll"]
-                cell["base_model_nll_increase"] = (
-                    round(mean_nll - baseline_nll, 4)
-                    if mean_nll is not None and baseline_nll is not None else None
-                )
+                nll_increase = None
+                if mean_nll is not None and baseline_nll is not None:
+                    nll_increase = round(mean_nll - baseline_nll, 4)
+
+                cell["base_model_nll_increase"] = nll_increase
                 cell["steered"] = f"{fired_counts[index]}/{generated_lengths[index]}"
-                result_key = f"{RECIPE_PREFIX}_{method}_lam{lam:g}"
+                result_key = f"{recipe_prefix}_{method}_lam{lam:g}"
                 records[index]["steered"][result_key] = cell
+
             if steerer.capture_trace:
-                trace = traces[index] if method is not None else {
-                    "online_code_ids": [], "edit_positions": [],
-                    "source_code_ids": [], "target_code_ids": [],
-                }
+                if method is None:
+                    trace = {
+                        "online_code_ids": [],
+                        "edit_positions": [],
+                        "source_code_ids": [],
+                        "target_code_ids": [],
+                    }
+                else:
+                    trace = traces[index]
+
                 audit_rows.append({
                     "response_id": int(batch[index][prompt_id_key]),
                     "label": int(batch[index]["label"]),
@@ -376,8 +477,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--train-set", default=None,
-                        help="training pool used by the VQ checkpoint")
+    parser.add_argument("--train-set", default="train")
     parser.add_argument("--activation-cache",
                         help="training activation cache used for code means (default: selected train set)")
     parser.add_argument("--test-set", default="test",
@@ -385,17 +485,28 @@ def parse_args():
     parser.add_argument("--selection-seed", type=int, default=42,
                         help="seed for the outer detector split and its class-balanced random sample")
     parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL)
-    parser.add_argument("--checkpoint", "--ckpt", dest="checkpoint", required=True)
-    parser.add_argument("--n-unsafe", "--n_unsafe", dest="n_unsafe", type=int, default=None)
-    parser.add_argument("--n-safe", "--n_safe", dest="n_safe", type=int, default=None)
-    parser.add_argument("--lambdas", "--lams", dest="lambdas", type=float, nargs="+", default=[0.5])
-    parser.add_argument("--max-new-tokens", "--max_new_tokens", dest="max_new_tokens", type=int, default=2048)
-    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=8,
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--n-unsafe", type=int, default=None)
+    parser.add_argument("--n-safe", type=int, default=None)
+    parser.add_argument("--lambdas", type=float, nargs="+", default=[1.0, 2.0, 4.0])
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=8,
                         help="prompts generated together per call (1 = exact per-prompt reference)")
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=["additive_renorm_gate"],
-                        metavar="METHOD")
-    parser.add_argument("--min-benign-response-support", type=int, default=10,
-                        help="minimum training responses containing a benign target concept")
+    parser.add_argument(
+        "--methods", nargs="+", choices=ALL_METHODS,
+        default=["additive", "additive_gate"], metavar="METHOD",
+        help="base methods plus optional _renorm and _gate modifiers",
+    )
+    parser.add_argument("--concept", choices=["codebook", "code_mean"], default="code_mean",
+                        help="trained code vectors or each code's mean training activation")
+    parser.add_argument(
+        "--counterpart-selection", choices=COUNTERPART_SELECTIONS, default="fixed",
+        help="fixed code-level pair or nearest reliable benign code to the current activation",
+    )
+    parser.add_argument(
+        "--min-benign-response-support", type=int, default=10,
+        help="minimum training responses containing a code before it can be a dynamic benign target",
+    )
     parser.add_argument("--code-score-prior-strength", type=float, default=None,
                         help="response-equivalent harmfulness prior (default: checkpoint value or 10)")
     parser.add_argument("--resume", action="store_true",
@@ -410,11 +521,11 @@ def parse_args():
 def main():
     args = parse_args()
 
-    training_data = training_split(args.train_set or DETECTOR_TRAIN_SET_BY_DATASET[args.dataset], args.dataset)
+    # Resolve the training and evaluation partitions used by this run.
+    training_data = training_split(args.train_set or "train", args.dataset)
     outer_validation = args.test_set == "outer_validation"
     if outer_validation:
-        detector_train_set = DETECTOR_TRAIN_SET_BY_DATASET[args.dataset]
-        evaluation_data = training_split(detector_train_set, args.dataset)
+        evaluation_data = training_data
     else:
         evaluation_data = evaluation_split(args.test_set, args.dataset)
     args.train_set = training_data.name
@@ -422,218 +533,185 @@ def main():
     if outer_validation:
         args.n_unsafe = args.n_unsafe if args.n_unsafe is not None else 200
         args.n_safe = args.n_safe if args.n_safe is not None else 200
-    checkpoint_path = resolve_project_path(args.checkpoint)
+    checkpoint_path = Path(args.checkpoint)
 
     run_dir = Path(args.out)
     run_dir.mkdir(parents=True, exist_ok=True)
     output_path = run_dir / "intervene.json"
-    audit_cache_path = resolve_project_path(args.audit_cache_out) if args.audit_cache_out else None
+    audit_cache_path = Path(args.audit_cache_out) if args.audit_cache_out else None
     if output_path.exists() and not args.resume:
-        raise FileExistsError(f"{output_path} already exists; pass --resume to continue it")
-    if not torch.cuda.is_available():
-        raise RuntimeError("steering requires a GPU compute node")
-    device = "cuda"
+        raise FileExistsError(f"{output_path} already exists; pass --resume to continue it safely")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     started_at = time.time()
 
-    model_path = base_model_path(args.base_model)
-    configure_transformers_compatibility()
+    # Load the frozen generator and the VQ checkpoint that defines the concepts.
+    model_path = MODEL_DIR / args.base_model
+    restore_transformers_loss_kwargs()
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path), dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True
     ).eval()
-    initialize_internlm3_rotary_embeddings(model)
+    repair_internlm3_rotary_embeddings(model)
     transcoder, num_codes = load_steering_vq_checkpoint(checkpoint_path, device)
     read_layer = int(transcoder.checkpoint_config.get("read_layer", READ_LAYER))
     hook_layer_index = read_layer - 1
 
     checkpoint_config = transcoder.checkpoint_config
-    expected_checkpoint_values = {
-        "dataset": args.dataset,
-        "train_set": args.train_set,
-        "base_model": args.base_model,
-    }
-    for name, expected in expected_checkpoint_values.items():
-        recorded = checkpoint_config.get(name)
-        if recorded is not None and recorded != expected:
-            raise ValueError(f"checkpoint {name} is {recorded!r}, but the run requested {expected!r}")
-
-    if (checkpoint_config.get("dataset") == args.dataset
-            and checkpoint_config.get("train_set") == args.train_set):
-        recorded_cache = checkpoint_config.get("training_cache")
-    else:
-        recorded_cache = None
-    cache_override = args.activation_cache or recorded_cache
-    training_cache = resolve_activation_cache(
-        args.dataset,
-        training_data,
-        explicit_path=cache_override,
-    )
+    cache_override = args.activation_cache or checkpoint_config.get("training_cache")
+    if cache_override is None:
+        raise ValueError("--activation-cache is required when the VQ checkpoint does not record one")
+    training_cache = Path(cache_override)
     if args.code_score_prior_strength is None:
         args.code_score_prior_strength = transcoder.checkpoint_config.get("code_score_prior_strength", 10.0)
 
-    harmful_codes, concept_vectors, counterparts, harmful_scores, reliable_benign_codes = build_steering_targets(
-        transcoder, num_codes, device, training_cache, read_layer,
+    # Build harmful-to-benign directions and attach the activation hook.
+    targets = build_steering_targets(
+        transcoder, num_codes, device, args.concept, training_cache, read_layer,
         args.code_score_prior_strength, args.min_benign_response_support,
     )
-    harmful_weights = normalized_gate_weights(harmful_scores, harmful_codes)
+    harmful_weights = normalized_gate_weights(targets.harmful_scores, targets.harmful_codes)
     elapsed = time.time() - started_at
-    print(f"loaded: {len(harmful_codes)}/{num_codes} harmful codes | "
-          f"{len(reliable_benign_codes)} reliable benign targets | {elapsed:.0f}s", flush=True)
+    print(f"loaded: {len(targets.harmful_codes)}/{num_codes} harmful codes | "
+          f"{len(targets.reliable_benign_codes)} reliable benign targets | concept={args.concept} | "
+          f"counterpart={args.counterpart_selection} | {elapsed:.0f}s", flush=True)
 
     steerer = ActivationSteerer(
-        transcoder, harmful_codes, concept_vectors, counterparts,
-        harmful_weights, device, capture_trace=audit_cache_path is not None,
+        transcoder, targets.harmful_codes, targets.concept_vectors, targets.fixed_counterparts,
+        harmful_weights, targets.reliable_benign_codes, args.counterpart_selection, device,
+        capture_trace=audit_cache_path is not None,
     )
     handle = model.model.layers[hook_layer_index].register_forward_hook(steerer)
 
-    evaluation_rows = [json.loads(line) for line in evaluation_data.source.read_text().splitlines()]
+    # Select the harmful and safe prompts used for steering evaluation.
+    with evaluation_data.source.open() as input_file:
+        rows = [json.loads(line) for line in input_file]
     if outer_validation:
-        _, evaluation_rows = train_validation_split(evaluation_rows, args.selection_seed)
-        requested_prompts = sample_labeled_rows(
-            evaluation_rows, args.n_unsafe, args.n_safe, args.selection_seed
-        )
+        _, rows = train_validation_split(rows, args.selection_seed)
+        requested_prompts = sample_labeled_rows(rows, args.n_unsafe, args.n_safe, args.selection_seed)
     else:
-        unsafe_rows = [row for row in evaluation_rows if row["label"] == 1]
-        safe_rows = [row for row in evaluation_rows if row["label"] == 0]
-        args.n_unsafe = len(unsafe_rows) if args.n_unsafe is None else args.n_unsafe
+        harmful_rows = [row for row in rows if row["label"] == 1]
+        safe_rows = [row for row in rows if row["label"] == 0]
+        args.n_unsafe = len(harmful_rows) if args.n_unsafe is None else args.n_unsafe
         args.n_safe = len(safe_rows) if args.n_safe is None else args.n_safe
-        requested_prompts = unsafe_rows[:args.n_unsafe] + safe_rows[:args.n_safe]
+        harmful_prompts = harmful_rows[:args.n_unsafe]
+        safe_prompts = safe_rows[:args.n_safe]
+        requested_prompts = harmful_prompts + safe_prompts
+
         if len(requested_prompts) != args.n_unsafe + args.n_safe:
             raise ValueError(
                 f"requested {args.n_unsafe} harmful and {args.n_safe} safe responses, "
                 f"but {len(requested_prompts)} total were available"
             )
     prompt_id_key = evaluation_data.id_key
-    remaining_prompts = requested_prompts
-    prompt_order = {row[prompt_id_key]: index for index, row in enumerate(requested_prompts)}
+    prompts = requested_prompts
     results = []
-    completed_ids = set()
-    run_config = {
-        "dataset": args.dataset,
-        "train_set": args.train_set,
-        "test_set": args.test_set,
-        "base_model": args.base_model,
-        "concept": "code_mean",
-        "read_layer": read_layer,
-        "counterpart_selection": "fixed",
-        "min_benign_response_support": args.min_benign_response_support,
-        "code_score_prior_strength": args.code_score_prior_strength,
-        "methods": args.methods,
-        "lambdas": args.lambdas,
-        "max_new_tokens": args.max_new_tokens,
-        "n_unsafe": args.n_unsafe,
-        "n_safe": args.n_safe,
-        "batch_size": args.batch_size,
-    }
-    if outer_validation:
-        run_config["selection_seed"] = args.selection_seed
+    completed_indices = set()
+    recipe_prefix = COUNTERPART_SELECTIONS[args.counterpart_selection]
 
     if args.resume:
         if not output_path.exists():
             raise FileNotFoundError(f"cannot resume because {output_path} does not exist")
 
         previous_run = json.loads(output_path.read_text())
-        expected_values = dict(run_config)
-        if "selection_seed" in previous_run:
-            expected_values["selection_seed"] = args.selection_seed
-        mismatches = [
-            f"{name}: saved={previous_run.get(name)!r}, requested={value!r}"
-            for name, value in expected_values.items() if previous_run.get(name) != value
-        ]
-        saved_checkpoint = Path(previous_run.get("checkpoint", "")).resolve()
-        if saved_checkpoint != checkpoint_path.resolve():
-            mismatches.append(f"checkpoint: saved={saved_checkpoint}, requested={checkpoint_path.resolve()}")
-        saved_cache = Path(previous_run.get("activation_cache", "")).resolve()
-        if saved_cache != training_cache.resolve():
-            mismatches.append(f"activation_cache: saved={saved_cache}, requested={training_cache.resolve()}")
-        saved_audit_cache = previous_run.get("audit_cache")
-        requested_audit_cache = str(audit_cache_path) if audit_cache_path is not None else None
-        if saved_audit_cache != requested_audit_cache:
-            mismatches.append(
-                f"audit_cache: saved={saved_audit_cache!r}, requested={requested_audit_cache!r}"
-            )
-        if mismatches:
-            raise ValueError("cannot resume with a different configuration:\n  " + "\n  ".join(mismatches))
-
         results = previous_run.get("results", [])
-        completed_ids = {record["idx"] for record in results}
-        remaining_prompts = [
-            row for row in requested_prompts if row[prompt_id_key] not in completed_ids
-        ]
-        print(
-            f"resuming: kept {len(results)} completed prompts; {len(remaining_prompts)} remain",
-            flush=True,
-        )
+        completed_indices = {record["idx"] for record in results}
+        prompts = [row for row in requested_prompts if row[prompt_id_key] not in completed_indices]
+        print(f"resuming: kept {len(results)} completed prompts; {len(prompts)} remain", flush=True)
 
+    # Initialize the optional token-level audit record.
     audit_events_path = None
     audit_keys = set()
     if audit_cache_path is not None:
         result_keys = ["baseline"] + [
-            f"{RECIPE_PREFIX}_{method}_lam{lam:g}"
-            for method in args.methods for lam in args.lambdas
+            f"{recipe_prefix}_{method}_lam{lam:g}" for method in args.methods for lam in args.lambdas
         ]
         audit_events_path, audit_keys = initialize_steering_cache(
             audit_cache_path,
             {
-                "intervene_file": str(output_path.resolve()),
+                "intervene_file": str(output_path),
                 "checkpoint": str(checkpoint_path),
                 "dataset": args.dataset,
                 "test_set": args.test_set,
                 "base_model": args.base_model,
-                "concept_vector_source": "code_mean",
-                "counterpart_selection": "fixed",
+                "concept_vector_source": args.concept,
+                "counterpart_selection": args.counterpart_selection,
                 "result_keys": result_keys,
                 "max_new_tokens": args.max_new_tokens,
             },
             resume=args.resume,
         )
-        missing_audit_rows = {
-            (int(response_id), result_key)
-            for response_id in completed_ids for result_key in result_keys
-        } - audit_keys
-        if missing_audit_rows:
-            raise ValueError(
-                f"steering run has {len(missing_audit_rows)} completed results without audit traces"
-            )
-
-    run_data = {
-        **run_config,
-        "evaluation_source": str(evaluation_data.source),
-        "evaluation_partition": "outer_validation" if outer_validation else "test",
-        "checkpoint": str(checkpoint_path),
-        "hook_layer_index": hook_layer_index,
-        "activation_cache": str(training_cache),
-        "n_reliable_benign_codes": len(reliable_benign_codes),
-        "code_score_method": (transcoder.checkpoint_regions or {}).get("score_method"),
-        "code_score_source": "VQ checkpoint",
-        "recipes": [f"{RECIPE_PREFIX}_{method}" for method in args.methods],
-        "lams": args.lambdas,
-        "n_harmful_codes": len(harmful_codes),
-        "harmful_codes": harmful_codes,
-        "harmful_code_scores": [round(float(score), 8) for score in harmful_scores.cpu()],
-        "harmful_code_weights": [round(float(weight), 8) for weight in harmful_weights.cpu()],
-        "results": results,
-    }
-    if audit_cache_path is not None:
-        run_data["audit_cache"] = str(audit_cache_path)
 
     def save():
-        with output_path.open("w") as output_file:
-            json.dump(run_data, output_file, indent=2, ensure_ascii=False)
+        data = {
+            "dataset": args.dataset,
+            "train_set": args.train_set,
+            "test_set": args.test_set,
+            "evaluation_source": str(evaluation_data.source),
+            "evaluation_partition": "outer_validation" if outer_validation else "test",
+            "base_model": args.base_model,
+            "checkpoint": str(checkpoint_path),
+            "concept": args.concept,
+            "read_layer": read_layer,
+            "hook_layer_index": hook_layer_index,
+            "activation_cache": str(training_cache),
+            "counterpart_selection": args.counterpart_selection,
+            "min_benign_response_support": args.min_benign_response_support,
+            "n_reliable_benign_codes": len(targets.reliable_benign_codes),
+            "code_score_prior_strength": args.code_score_prior_strength,
+            "code_score_method": transcoder.checkpoint_regions.get("score_method"),
+            "code_score_source": "VQ checkpoint",
+            "methods": args.methods,
+            "lambdas": args.lambdas,
+            "recipes": [f"{recipe_prefix}_{method}" for method in args.methods],
+            "max_new_tokens": args.max_new_tokens,
+            "n_unsafe": args.n_unsafe,
+            "n_safe": args.n_safe,
+            "batch_size": args.batch_size,
+            "n_harmful_codes": len(targets.harmful_codes),
+            "harmful_codes": targets.harmful_codes,
+            "harmful_code_scores": [round(float(score), 8) for score in targets.harmful_scores.cpu()],
+            "harmful_code_weights": [round(float(weight), 8) for weight in harmful_weights.cpu()],
+            "results": results,
+        }
+        if outer_validation:
+            data["selection_seed"] = args.selection_seed
+        if audit_cache_path is not None:
+            data["audit_cache"] = str(audit_cache_path)
+        (run_dir / "intervene.json").write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        )
 
-    for start in range(0, len(remaining_prompts), args.batch_size):
-        batch = remaining_prompts[start:start + args.batch_size]
+    # Generate, score, and save each prompt batch.
+    for start in range(0, len(prompts), args.batch_size):
+        batch = prompts[start:start + args.batch_size]
         records, audit_rows = process_batch(
             model, tokenizer, transcoder, steerer, batch, args.lambdas, args.max_new_tokens,
-            args.methods, read_layer, prompt_id_key,
+            args.methods, recipe_prefix, read_layer, prompt_id_key,
         )
         if audit_events_path is not None:
             append_steering_cache(audit_events_path, audit_rows, audit_keys)
         results.extend(records)
+        prompt_order = {row[prompt_id_key]: index for index, row in enumerate(requested_prompts)}
         results.sort(key=lambda record: prompt_order[record["idx"]])
         save()
         for record in records:
-            print(f"[{record['idx']}] label={record['label']} complete", flush=True)
+            summary = {}
+            for method in args.methods:
+                rates = []
+                for strength in args.lambdas:
+                    key = f"{recipe_prefix}_{method}_lam{strength:g}"
+                    rate = record["steered"][key]["rate"]
+                    rates.append(None if rate is None else round(rate, 2))
+                summary[method] = rates
+
+            baseline_rate = record["baseline"]["rate"]
+            if baseline_rate is not None:
+                baseline_rate = round(baseline_rate, 2)
+            print(
+                f"[{record['idx']}] label={record['label']} "
+                f"base={baseline_rate} {summary}",
+                flush=True,
+            )
 
     handle.remove()
     elapsed_minutes = (time.time() - started_at) / 60

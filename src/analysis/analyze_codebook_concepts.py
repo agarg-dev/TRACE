@@ -5,8 +5,7 @@ import argparse
 import csv
 import json
 from collections import Counter, defaultdict
-
-from project_config import resolve_project_path
+from pathlib import Path
 
 
 def parse_args():
@@ -23,13 +22,65 @@ def read_jsonl(path):
         return [json.loads(line) for line in input_file if line.strip()]
 
 
-def rows_by_code(rows):
+def unique_rows(rows):
     return {int(row["code_id"]): row for row in rows}
 
 
-def weighted_fraction(rows, weight):
-    denominator = sum(weight(row) for row in rows)
-    numerator = sum(weight(row) for row in rows if row["status"] == "clear")
+def valid_complete_judgment(row):
+    if row.get("state") != "complete" or not isinstance(row.get("judgment"), dict):
+        return False, "judgment is not complete"
+    judgment = row["judgment"]
+    if set(judgment) != {"status", "name", "description", "safety_label"}:
+        return False, "judgment fields do not match the schema"
+    if judgment["status"] not in {"clear", "mixed", "no_pattern"}:
+        return False, "invalid status"
+
+    if judgment["status"] == "clear":
+        if not isinstance(judgment["name"], str) or not judgment["name"].strip():
+            return False, "clear concept has no name"
+        if not isinstance(judgment["description"], str) or not judgment["description"].strip():
+            return False, "clear concept has no description"
+        if judgment["safety_label"] not in {
+            "harmful", "benign", "neutral"
+        }:
+            return False, "clear concept has an invalid safety label"
+    elif (judgment["name"] is not None or judgment["description"] is not None or
+          judgment["safety_label"] is not None):
+        return False, "non-clear concept has concept fields"
+    return True, None
+
+
+def valid_agreement_judgment(row, valid_run_ids):
+    if row.get("state") != "complete" or not isinstance(row.get("judgment"), dict):
+        return False, "agreement judgment is not complete"
+    judgment = row["judgment"]
+    required = {"agreement", "name", "description", "agreeing_run_ids"}
+    if set(judgment) != required:
+        return False, "agreement judgment fields do not match the schema"
+    if not isinstance(judgment["agreement"], bool):
+        return False, "agreement is not a boolean"
+
+    ids = judgment["agreeing_run_ids"]
+    if not isinstance(ids, list) or any(isinstance(item, bool) or not isinstance(item, int) for item in ids):
+        return False, "agreeing run IDs are not integers"
+    if len(ids) != len(set(ids)) or not set(ids).issubset(set(valid_run_ids)):
+        return False, "agreeing run IDs are duplicated or invalid"
+
+    if judgment["agreement"]:
+        if len(ids) < 2:
+            return False, "semantic agreement has fewer than two agreeing runs"
+        if not isinstance(judgment["name"], str) or not judgment["name"].strip():
+            return False, "semantic agreement has no name"
+        if not isinstance(judgment["description"], str) or not judgment["description"].strip():
+            return False, "semantic agreement has no description"
+    elif judgment["name"] is not None or judgment["description"] is not None or ids:
+        return False, "no agreement has concept fields or agreeing run IDs"
+    return True, None
+
+
+def weighted_fraction(rows, weights):
+    denominator = sum(weights(row) for row in rows)
+    numerator = sum(weights(row) for row in rows if row["status"] == "clear")
     return numerator / denominator if denominator else None
 
 
@@ -65,25 +116,29 @@ def status_summary(rows):
 
 
 def build_rows(examples, judgments):
+    selected = {code for code, row in examples.items() if row["selected_for_judging"]}
     rows = []
-    selected = [code for code, row in examples.items() if row["selected_for_judging"]]
     for code in sorted(selected):
         example_row = examples[code]
         example_count = len(example_row["examples"])
+
         judgment_row = judgments.get(code)
         if judgment_row is None:
             status, name, description, safety_label = "missing", None, None, None
             error = "no judgment saved"
-        elif judgment_row["state"] == "error":
+        elif judgment_row.get("state") == "error":
             status, name, description, safety_label = "error", None, None, None
             error = judgment_row.get("error") or "Gemini request failed"
         else:
-            judgment = judgment_row["judgment"]
-            status = judgment["status"]
-            name = judgment["name"]
-            description = judgment["description"]
-            safety_label = judgment["safety_label"]
-            error = None
+            valid, error = valid_complete_judgment(judgment_row)
+            if not valid:
+                status, name, description, safety_label = "error", None, None, None
+            else:
+                judgment = judgment_row["judgment"]
+                status = judgment["status"]
+                name = judgment["name"]
+                description = judgment["description"]
+                safety_label = judgment["safety_label"]
 
         row = {
             "code_id": code,
@@ -122,29 +177,18 @@ def write_json(path, value):
 def consensus_rows(runs, agreement_judgments):
     manifests = [json.loads((run / "manifest.json").read_text()) for run in runs]
     analyses = [json.loads((run / "analysis.json").read_text()) for run in runs]
-    if len({manifest["dataset"] for manifest in manifests}) != 1:
-        raise ValueError("consensus runs use different datasets")
-    if len({manifest["judge_model"] for manifest in manifests}) != 1:
-        raise ValueError("consensus runs use different judge models")
-    if len({int(manifest["examples_per_code"]) for manifest in manifests}) != 1:
-        raise ValueError("consensus runs use different example counts")
     seeds = [int(manifest["seed"]) for manifest in manifests]
-    if len(set(seeds)) != len(seeds):
-        raise ValueError("consensus runs must use distinct sampling seeds")
 
-    concepts = [rows_by_code(analysis["concepts"]) for analysis in analyses]
+    concepts = [unique_rows(analysis["concepts"]) for analysis in analyses]
     common_codes = set.intersection(*(set(rows) for rows in concepts))
     rows = []
     for code in sorted(common_codes):
         code_rows = [concept[code] for concept in concepts]
-        if len({row["region"] for row in code_rows}) != 1:
-            raise ValueError(f"region differs across runs for code {code}")
-        if len({row["harmfulness_score"] for row in code_rows}) != 1:
-            raise ValueError(f"harmfulness score differs across runs for code {code}")
-
         statuses = [row["status"] for row in code_rows]
         clear_votes = statuses.count("clear")
-        has_clear_majority = clear_votes >= 2
+        clear_run_ids = [run_id for run_id, status in enumerate(statuses, start=1)
+                         if status == "clear"]
+        clear_status_majority = clear_votes >= 2
 
         agreement_state = "not_applicable"
         agreement_error = None
@@ -153,7 +197,7 @@ def consensus_rows(runs, agreement_judgments):
         consensus_description = None
         agreeing_run_ids = []
         agreement_row = agreement_judgments.get(code)
-        if has_clear_majority:
+        if clear_status_majority:
             if agreement_row is None:
                 agreement_state = "missing"
                 agreement_error = "no semantic-agreement judgment saved"
@@ -161,14 +205,18 @@ def consensus_rows(runs, agreement_judgments):
                 agreement_state = "error"
                 agreement_error = agreement_row.get("error") or "Gemini agreement request failed"
             else:
-                judgment = agreement_row["judgment"]
-                agreement = judgment["agreement"]
-                agreement_state = "agreement" if agreement else "no_agreement"
-                consensus_name = judgment["name"]
-                consensus_description = judgment["description"]
-                agreeing_run_ids = judgment["agreeing_run_ids"]
-        elif agreement_row is not None:
-            raise ValueError(f"unexpected semantic-agreement judgment for code {code}")
+                valid, agreement_error = valid_agreement_judgment(
+                    agreement_row, clear_run_ids
+                )
+                if valid:
+                    judgment = agreement_row["judgment"]
+                    agreement = judgment["agreement"]
+                    agreement_state = "agreement" if agreement else "no_agreement"
+                    consensus_name = judgment["name"]
+                    consensus_description = judgment["description"]
+                    agreeing_run_ids = judgment["agreeing_run_ids"]
+                else:
+                    agreement_state = "error"
 
         agreeing_labels = [code_rows[run_id - 1]["safety_label"]
                            for run_id in agreeing_run_ids]
@@ -185,7 +233,7 @@ def consensus_rows(runs, agreement_judgments):
             "harmfulness_score": code_rows[0]["harmfulness_score"],
             "response_support": code_rows[0]["response_support"],
             "clear_votes": clear_votes,
-            "clear_status_majority": has_clear_majority,
+            "clear_status_majority": clear_status_majority,
             "unanimous_clear_status": clear_votes == 3,
             "clear_consensus": agreement is True,
             "unanimously_clear": agreement is True and len(agreeing_run_ids) == 3,
@@ -243,20 +291,17 @@ def write_consensus_csv(path, rows):
 def analyze_consensus(runs, output):
     output.mkdir(parents=True, exist_ok=True)
     judgment_path = output / "agreement_judgments.jsonl"
-    agreement_judgments = rows_by_code(read_jsonl(judgment_path))
+    agreement_judgments = unique_rows(read_jsonl(judgment_path))
     manifests, analyses, rows = consensus_rows(runs, agreement_judgments)
 
-    majority_rows = [row for row in rows if row["clear_status_majority"]]
-    consensus_concepts = [row for row in rows if row["clear_consensus"]]
+    clear_status_majority = [row for row in rows if row["clear_status_majority"]]
+    clear_consensus = [row for row in rows if row["clear_consensus"]]
     safety_counts = Counter(
-        row["safety_consensus"] for row in consensus_concepts
+        row["safety_consensus"] for row in clear_consensus
         if row["safety_consensus"] is not None
     )
-    unanimous_clear_count = sum(row["unanimously_clear"] for row in rows)
-    safety_consensus_count = sum(
-        row["safety_consensus"] is not None for row in consensus_concepts
-    )
     result = {
+        "format_version": 2,
         "runs": [str(run) for run in runs],
         "seeds": [int(manifest["seed"]) for manifest in manifests],
         "checkpoint": manifests[0]["checkpoint"],
@@ -264,23 +309,27 @@ def analyze_consensus(runs, output):
         "judge_model": manifests[0]["judge_model"],
         "examples_per_run": int(manifests[0]["examples_per_code"]),
         "codes_selected_in_all_runs": len(rows),
-        "clear_status_majority_count": len(majority_rows),
+        "clear_status_majority_count": len(clear_status_majority),
         "clear_status_majority_fraction": (
-            len(majority_rows) / len(rows) if rows else None
+            len(clear_status_majority) / len(rows) if rows else None
         ),
         "unanimous_clear_status_count": sum(row["unanimous_clear_status"] for row in rows),
-        "clear_consensus_count": len(consensus_concepts),
-        "clear_consensus_fraction": len(consensus_concepts) / len(rows) if rows else None,
+        "clear_consensus_count": len(clear_consensus),
+        "clear_consensus_fraction": len(clear_consensus) / len(rows) if rows else None,
         "clear_consensus_fraction_of_candidates": (
-            len(consensus_concepts) / len(majority_rows) if majority_rows else None
+            len(clear_consensus) / len(clear_status_majority)
+            if clear_status_majority else None
         ),
-        "unanimously_clear_count": unanimous_clear_count,
+        "unanimously_clear_count": sum(row["unanimously_clear"] for row in rows),
         "unanimously_clear_fraction": (
-            unanimous_clear_count / len(rows) if rows else None
+            sum(row["unanimously_clear"] for row in rows) / len(rows) if rows else None
         ),
-        "safety_consensus_count": safety_consensus_count,
+        "safety_consensus_count": sum(
+            row["safety_consensus"] is not None for row in clear_consensus
+        ),
         "safety_consensus_fraction_of_clear": (
-            safety_consensus_count / len(consensus_concepts) if consensus_concepts else None
+            sum(row["safety_consensus"] is not None for row in clear_consensus) /
+            len(clear_consensus) if clear_consensus else None
         ),
         "safety_consensus_counts": {
             label: safety_counts.get(label, 0) for label in ("harmful", "benign", "neutral")
@@ -296,26 +345,27 @@ def analyze_consensus(runs, output):
     write_json(output / "consensus.json", result)
     write_consensus_csv(output / "consensus.csv", rows)
     print(
-        f"Consensus over {len(rows)} codes: {len(majority_rows)} clear-status candidates, "
-        f"{len(consensus_concepts)} with semantic agreement"
+        f"Consensus over {len(rows)} codes: {len(clear_status_majority)} clear-status candidates, "
+        f"{len(clear_consensus)} with semantic agreement"
     )
     print(f"Saved {output / 'consensus.json'} and {output / 'consensus.csv'}")
 
 
 def analyze(run):
     manifest = json.loads((run / "manifest.json").read_text())
-    examples = rows_by_code(read_jsonl(run / "examples.jsonl"))
+    examples = unique_rows(read_jsonl(run / "examples.jsonl"))
     judgment_path = run / "judgments.jsonl"
-    judgments = rows_by_code(read_jsonl(judgment_path)) if judgment_path.exists() else {}
-    concept_rows = build_rows(examples, judgments)
+    judgments = unique_rows(read_jsonl(judgment_path)) if judgment_path.exists() else {}
+    rows = build_rows(examples, judgments)
 
     by_region = defaultdict(list)
-    for row in concept_rows:
+    for row in rows:
         by_region[row["region"]].append(row)
     insufficient = sum(
         row["selection_status"] == "insufficient_support" for row in examples.values()
     )
     result = {
+        "format_version": int(manifest.get("format_version", 1)),
         "run": str(run),
         "checkpoint": manifest["checkpoint"],
         "dataset": manifest["dataset"],
@@ -324,16 +374,17 @@ def analyze(run):
         "eligible_codes": manifest["eligible_code_count"],
         "selected_codes": manifest["selected_code_count"],
         "insufficient_support_codes": insufficient,
-        "overall": status_summary(concept_rows),
+        "partial_run": manifest["partial_run"],
+        "overall": status_summary(rows),
         "by_region": {region: status_summary(region_rows)
                       for region, region_rows in sorted(by_region.items())},
-        "concepts": concept_rows,
+        "concepts": rows,
     }
     write_json(run / "analysis.json", result)
-    write_csv(run / "concepts.csv", concept_rows)
+    write_csv(run / "concepts.csv", rows)
 
     counts = result["overall"]["counts"]
-    print(f"Analyzed {len(concept_rows)} selected codes from {manifest['dataset']}")
+    print(f"Analyzed {len(rows)} selected codes from {manifest['dataset']}")
     print(
         f"clear {counts['clear']} | mixed {counts['mixed']} | no pattern {counts['no_pattern']} | "
         f"error {counts['error']} | missing {counts['missing']}"
@@ -346,14 +397,19 @@ def main():
     if args.run:
         if args.output:
             raise ValueError("--output is only used with --consensus-runs")
-        run = resolve_project_path(args.run).resolve()
+        run = Path(args.run)
+        if not run.is_dir():
+            raise FileNotFoundError(f"analysis run does not exist: {run}")
         analyze(run)
         return
 
     if not args.output:
         raise ValueError("--output is required with --consensus-runs")
-    runs = [resolve_project_path(path).resolve() for path in args.consensus_runs]
-    analyze_consensus(runs, resolve_project_path(args.output).resolve())
+    runs = [Path(path) for path in args.consensus_runs]
+    missing = [run for run in runs if not run.is_dir()]
+    if missing:
+        raise FileNotFoundError(f"analysis run does not exist: {missing[0]}")
+    analyze_consensus(runs, Path(args.output))
 
 
 if __name__ == "__main__":

@@ -4,17 +4,19 @@
 import argparse
 import json
 import time
+from pathlib import Path
+
 import numpy as np
 import torch
 import yaml
 
-from activations.activation_cache import (
+from activations.cache import (
     load_activation_sequences,
     read_activation_cache_info,
-    resolve_activation_cache,
+    validate_prompt_activation_cache,
 )
-from data.dataset_splits import DETECTOR_TRAIN_SET_BY_DATASET, train_validation_split, training_split
-from project_config import DEFAULT_DATASET, DETECTION_RUNS_DIR, READ_LAYER, resolve_project_path
+from data.dataset_splits import DEFAULT_DATASET, train_validation_split, training_split
+from project_config import DETECTION_RUNS_DIR, READ_LAYER
 from vq.model import load_vq_checkpoint
 
 from detection.sequence_classifier import (
@@ -24,6 +26,7 @@ from detection.sequence_classifier import (
     activation_mean_code_vectors,
     assign_code_sequences,
     assign_hybrid_sequences,
+    attach_prompt_activations,
     checkpoint_code_feature_statistics,
     evaluate_loss,
     initial_hazard_bias,
@@ -31,10 +34,13 @@ from detection.sequence_classifier import (
     pad_activation_batch,
     pad_code_batch,
     pad_hybrid_batch,
+    pad_prompt_conditioned_code_batch,
+    pad_prompt_conditioned_hybrid_batch,
     rescore_no_task_checkpoint_by_response_presence,
     score_activation_sequences,
     score_code_sequences,
     score_hybrid_sequences,
+    score_prompt_conditioned_hybrid_sequences,
     select_thresholds,
     sequence_batches,
     streaming_classification_loss,
@@ -43,32 +49,35 @@ from detection.sequence_classifier import (
 )
 
 
-def read_config_path():
+def read_config():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config")
     config_path = parser.parse_known_args()[0].config
     if not config_path:
         return {}
-
-    path = resolve_project_path(config_path)
-    return yaml.safe_load(path.read_text()) or {}
+    return yaml.safe_load(Path(config_path).read_text()) or {}
 
 
 def parse_args():
-    config = read_config_path()
+    config = read_config()
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="YAML file containing detector settings")
     parser.add_argument("--input-representation", choices=["vq", "raw", "hybrid"], default="vq",
                         help="VQ vectors, raw cached activations, or both representations")
     parser.add_argument("--vq-run")
-    parser.add_argument("--vq-checkpoint", default="model_joint.pt")
+    parser.add_argument("--vq-checkpoint", default="model_task.pt")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--train-set", default=None)
+    parser.add_argument("--train-set", default="train")
     parser.add_argument("--activation-cache", default=None,
                         help="activation cache to use (VQ mode defaults to its recorded training cache)")
     parser.add_argument("--activation-layer", type=int, default=None,
                         help="cached layer to read (VQ mode defaults to the checkpoint's read layer)")
-    parser.add_argument("--out", help="classifier run directory")
+    parser.add_argument("--prompt-activation-cache", default=None,
+                        help="prompt-only cache used to initialize the VQ or hybrid GRU state")
+    parser.add_argument(
+        "--out", help="classifier run directory (default: timestamped detection run directory)"
+    )
+    parser.add_argument("--run-path-file", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--projection-dim", type=int, default=128)
     parser.add_argument("--raw-projection-dim", type=int, default=256,
                         help="raw branch width in hybrid mode")
@@ -84,7 +93,7 @@ def parse_args():
     parser.add_argument("--code-vector-source", choices=["codebook", "activation_mean"], default="codebook",
                         help="frozen vector looked up for each assigned VQ code")
     parser.add_argument("--code-score-prior-strength", type=float, default=10.0,
-                        help="required prior strength of the stored VQ harmfulness score")
+                        help="response-equivalent prior used to estimate concept harmfulness")
     parser.add_argument("--harmfulness-score-weight", type=float, default=None,
                         help="direct signed code-score contribution to each token's hazard logit")
     parser.add_argument(
@@ -122,81 +131,88 @@ def main():
         raise ValueError("response-presence rescoring requires a VQ-based detector")
     if args.code_vector_source != "codebook" and not uses_vq:
         raise ValueError("activation-mean code vectors require VQ or hybrid input")
+    prompt_conditioning = args.prompt_activation_cache is not None
+    if prompt_conditioning and args.input_representation == "raw":
+        raise ValueError("prompt conditioning currently requires VQ or hybrid input")
     if args.harmfulness_score_weight is None:
         args.harmfulness_score_weight = 1.0 if uses_vq else 0.0
     if args.input_representation == "raw" and args.harmfulness_score_weight:
         args.harmfulness_score_weight = 0.0
-    args.train_set = args.train_set or DETECTOR_TRAIN_SET_BY_DATASET[args.dataset]
-    training_data = training_split(args.train_set, args.dataset)
+
+    training_data = training_split(args.train_set or "train", args.dataset)
     args.train_set = training_data.name
     device = "cuda" if torch.cuda.is_available() else "cpu"
     started_at = time.time()
 
+    # Load the VQ checkpoint when the detector uses discrete concepts.
     print("\nTEMPORAL ACTIVATION CLASSIFIER", flush=True)
     print(f"  input         : {args.input_representation}", flush=True)
     print(f"  training data : {args.dataset}/{training_data.name}", flush=True)
     print(f"  device        : {device}", flush=True)
     print(f"  selection     : {args.selection_metric} on validation responses", flush=True)
 
-    vq_run = vq_checkpoint_path = codebook = code_features = code_statistics = checkpoint_regions = None
-    code_vectors = code_vector_counts = None
+    vq_run = None
+    vq_checkpoint_path = None
+    codebook = None
+    code_features = None
+    code_statistics = None
+    checkpoint_regions = None
+    code_vectors = None
+    code_vector_counts = None
+
     if uses_vq:
-        vq_run = resolve_project_path(args.vq_run)
+        vq_run = Path(args.vq_run)
         vq_checkpoint_path = vq_run / args.vq_checkpoint
         print(f"  VQ checkpoint : {vq_checkpoint_path}", flush=True)
         vq_model, vq_checkpoint = load_vq_checkpoint(vq_checkpoint_path, device)
         vq_config = vq_checkpoint["config"]
         checkpoint_layer = int(vq_config.get("read_layer", READ_LAYER))
-        if args.activation_layer is not None and args.activation_layer != checkpoint_layer:
-            raise ValueError(
-                f"--activation-layer {args.activation_layer} does not match the VQ checkpoint's "
-                f"read layer {checkpoint_layer}"
-            )
         args.activation_layer = checkpoint_layer
-        split_seed = int(vq_config.get("seed", 42) if args.seed is None else args.seed)
+        split_seed = args.seed
+        if split_seed is None:
+            split_seed = vq_config.get("seed", 42)
+        split_seed = int(split_seed)
         checkpoint_regions = vq_checkpoint.get("regions")
         recorded_cache = vq_config.get("training_cache")
         if recorded_cache:
             print(f"  VQ training data: {recorded_cache}", flush=True)
-        else:
-            print("  checkpoint does not record its training cache", flush=True)
-        if args.activation_cache is None and recorded_cache:
-            checkpoint_dataset = vq_config.get("dataset")
-            checkpoint_train_set = vq_config.get("train_set")
-            if checkpoint_dataset == args.dataset and checkpoint_train_set == args.train_set:
-                args.activation_cache = recorded_cache
+        if args.activation_cache is None:
+            args.activation_cache = recorded_cache
         del vq_checkpoint
     else:
-        args.activation_layer = READ_LAYER if args.activation_layer is None else args.activation_layer
-        split_seed = int(42 if args.seed is None else args.seed)
+        if args.activation_layer is None:
+            args.activation_layer = READ_LAYER
+        split_seed = 42 if args.seed is None else int(args.seed)
 
-    activation_cache = resolve_activation_cache(
-        args.dataset,
-        training_data,
-        explicit_path=args.activation_cache,
-    )
+    # Convert cached responses into the representation consumed by the detector.
+    if args.activation_cache is None:
+        raise ValueError("--activation-cache is required when the VQ checkpoint does not record one")
+    activation_cache = Path(args.activation_cache)
     print(f"  activations   : layer {args.activation_layer} from {activation_cache}", flush=True)
     activation_sequences = load_activation_sequences(activation_cache, args.activation_layer)
     if uses_vq:
         retain_response_activations = (
             args.input_representation == "hybrid" or args.code_vector_source == "activation_mean"
         )
-        sequences = (
-            assign_hybrid_sequences(vq_model, activation_sequences, device, args.code_batch_size)
-            if retain_response_activations
-            else assign_code_sequences(vq_model, activation_sequences, device, args.code_batch_size)
-        )
+        if retain_response_activations:
+            sequences = assign_hybrid_sequences(
+                vq_model, activation_sequences, device, args.code_batch_size
+            )
+        else:
+            sequences = assign_code_sequences(
+                vq_model, activation_sequences, device, args.code_batch_size
+            )
         codebook = vq_model.quantizer.codebook.detach().float().cpu().clone()
         num_codes = codebook.shape[0]
         activation_dim = int(activation_sequences[0]["x"].shape[1])
         del activation_sequences, vq_model
         if args.input_representation == "hybrid":
-            pad_batch, score_sequences = pad_hybrid_batch, score_hybrid_sequences
+            pad_batch = pad_hybrid_batch
+            score_sequences = score_hybrid_sequences
         else:
-            pad_batch, score_sequences = pad_code_batch, score_code_sequences
+            pad_batch = pad_code_batch
+            score_sequences = score_code_sequences
         if args.rescore_response_presence:
-            if vq_config.get("dataset") != args.dataset or vq_config.get("train_set") != args.train_set:
-                raise ValueError("response-presence rescoring requires the VQ checkpoint's training dataset")
             checkpoint_regions = rescore_no_task_checkpoint_by_response_presence(
                 sequences, num_codes, vq_config, args.code_score_prior_strength
             )
@@ -211,12 +227,30 @@ def main():
         pad_batch = pad_activation_batch
         score_sequences = score_activation_sequences
 
+    # Attach prompt activations when they initialize the recurrent state.
+    prompt_cache_path = None
+    if prompt_conditioning:
+        prompt_cache_path = Path(args.prompt_activation_cache)
+        validate_prompt_activation_cache(prompt_cache_path, args.activation_layer)
+        prompt_sequences = load_activation_sequences(prompt_cache_path, args.activation_layer)
+        sequences = attach_prompt_activations(sequences, prompt_sequences)
+        prompt_activation_dim = int(prompt_sequences[0]["x"].shape[1])
+        args.prompt_activation_cache = str(prompt_cache_path)
+        if args.input_representation == "hybrid":
+            pad_batch = pad_prompt_conditioned_hybrid_batch
+            score_sequences = score_prompt_conditioned_hybrid_sequences
+        else:
+            pad_batch = pad_prompt_conditioned_code_batch
+            score_sequences = score_code_sequences
+        print(f"  prompt context: layer {args.activation_layer} from {prompt_cache_path}", flush=True)
+
     args.seed = split_seed
     torch.manual_seed(split_seed)
     np.random.seed(split_seed)
     if device == "cuda":
         torch.cuda.empty_cache()
 
+    # Split responses and compute the fixed concept features and class weights.
     train, validation = train_validation_split(sequences, split_seed)
     train_labels = np.array([sequence["label"] for sequence in train])
     n_safe, n_harmful = int((train_labels == 0).sum()), int((train_labels == 1).sum())
@@ -228,11 +262,19 @@ def main():
         if args.code_vector_source == "activation_mean":
             code_vectors, code_vector_counts = activation_mean_code_vectors(train, codebook)
             if args.input_representation == "vq":
-                train = [{name: value for name, value in sequence.items() if name != "x"} for sequence in train]
-                validation = [
-                    {name: value for name, value in sequence.items() if name != "x"}
-                    for sequence in validation
-                ]
+                stripped_train = []
+                for sequence in train:
+                    sequence = dict(sequence)
+                    sequence.pop("x", None)
+                    stripped_train.append(sequence)
+                train = stripped_train
+
+                stripped_validation = []
+                for sequence in validation:
+                    sequence = dict(sequence)
+                    sequence.pop("x", None)
+                    stripped_validation.append(sequence)
+                validation = stripped_validation
         code_features, code_statistics = checkpoint_code_feature_statistics(
             checkpoint_regions, train, num_codes, args.code_score_prior_strength
         )
@@ -242,9 +284,11 @@ def main():
     if uses_vq:
         print(f"  codebook      : {num_codes} × {codebook.shape[1]}", flush=True)
         if args.code_vector_source == "activation_mean":
-            print(f"  code vectors  : mean layer-{args.activation_layer} training activation per assigned code "
-                  f"({int((code_vector_counts == 0).sum())} unused codes retain codebook vectors)",
-                  flush=True)
+            print(
+                f"  code vectors  : mean layer-{args.activation_layer} training activation "
+                f"per assigned code ({int((code_vector_counts == 0).sum())} unused fallbacks)",
+                flush=True,
+            )
         else:
             print("  code vectors  : learned VQ codebook", flush=True)
         print(
@@ -252,34 +296,45 @@ def main():
             f"{code_statistics['score_source']} (prior strength {code_statistics['prior_strength']:g})",
             flush=True,
         )
-        print("  code support  : response presence in the classifier training split (labels unused)", flush=True)
+        print(
+            "  code support  : response presence in classifier training (labels unused)",
+            flush=True,
+        )
         print(f"  hazard prior  : code score × {args.harmfulness_score_weight:g} + GRU correction", flush=True)
         if args.input_representation == "hybrid":
             print(f"  raw branch    : {activation_dim} → {args.raw_projection_dim}", flush=True)
             print(f"  VQ branch     : {codebook.shape[1]} → {args.vq_projection_dim}", flush=True)
+            if prompt_conditioning:
+                print("  prompt state  : masked trainable attention pooling → GRU h0", flush=True)
+            prefix = "prompt_hybrid" if prompt_conditioning else "hybrid"
             vector_prefix = "activation_mean_" if args.code_vector_source == "activation_mean" else ""
-            default_run_name = f"{vector_prefix}hybrid_gru_hazard_K{num_codes}"
+            default_run_name = f"{vector_prefix}{prefix}_gru_hazard_K{num_codes}"
         else:
-            default_run_name = f"code_gru_hazard_K{num_codes}"
+            if prompt_conditioning:
+                print("  prompt state  : masked trainable attention pooling → GRU h0", flush=True)
+            prefix = "prompt_code" if prompt_conditioning else "code"
+            default_run_name = f"{prefix}_gru_hazard_K{num_codes}"
     else:
         print(f"  activations   : raw layer {args.activation_layer}, dimension {activation_dim}", flush=True)
         print("  hazard prior  : GRU prediction only (no VQ code-score features)", flush=True)
         default_run_name = "raw_activation_gru_hazard"
 
+    # Build the requested detector variant.
     run_dir = (
-        resolve_project_path(args.out) if args.out
+        Path(args.out) if args.out
         else DETECTION_RUNS_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{default_run_name}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     if args.input_representation == "vq":
         model = CodeSequenceClassifier(
             code_vectors, code_features, args.projection_dim, args.hidden_dim, args.num_layers,
-            args.dropout, hazard_bias, args.harmfulness_score_weight,
+            args.dropout, hazard_bias, args.harmfulness_score_weight, prompt_conditioning,
         ).to(device)
     elif args.input_representation == "hybrid":
         model = HybridSequenceClassifier(
             activation_dim, code_vectors, code_features, args.raw_projection_dim, args.vq_projection_dim,
             args.hidden_dim, args.num_layers, args.dropout, hazard_bias, args.harmfulness_score_weight,
+            prompt_conditioning,
         ).to(device)
     else:
         model = RawActivationSequenceClassifier(
@@ -292,6 +347,7 @@ def main():
         patience=args.lr_patience, min_lr=args.min_lr,
     )
 
+    # Train and retain the epoch with the best validation selection score.
     history, best_state = [], None
     best_selection_score, best_response_ap, best_streaming_ap = -1.0, -1.0, -1.0
     best_response_f1, best_streaming_f1 = -1.0, -1.0
@@ -319,23 +375,25 @@ def main():
             batch_count += 1
 
         train_losses = {name: value / max(1, batch_count) for name, value in totals.items()}
-        validation_losses = evaluate_loss(
-            model, validation, args.batch_size, args.response_weight, args.streaming_weight,
-            class_weights, device, pad_batch,
-        )
+        validation_losses = evaluate_loss(model, validation, args, class_weights, device, pad_batch)
         validation_scores = score_sequences(model, validation, args.batch_size, device)
-        validation_response_ap = float(summarize_scores(
-            validation_scores["labels"], validation_scores["response_scores"], {"argmax": 0.5}
-        )["average_precision"])
-        validation_streaming_ap = float(summarize_scores(
-            validation_scores["labels"], validation_scores["streaming_scores"], {"argmax": 0.5}
-        )["average_precision"])
-        validation_response_f1 = maximum_f1(validation_scores["labels"], validation_scores["response_scores"])
-        validation_streaming_f1 = maximum_f1(validation_scores["labels"], validation_scores["streaming_scores"])
+
+        labels = validation_scores["labels"]
+        response_scores = validation_scores["response_scores"]
+        streaming_scores = validation_scores["streaming_scores"]
+        response_summary = summarize_scores(labels, response_scores, {"argmax": 0.5})
+        streaming_summary = summarize_scores(labels, streaming_scores, {"argmax": 0.5})
+
+        validation_response_ap = float(response_summary["average_precision"])
+        validation_streaming_ap = float(streaming_summary["average_precision"])
+        validation_response_f1 = maximum_f1(labels, response_scores)
+        validation_streaming_f1 = maximum_f1(labels, streaming_scores)
+
         if args.selection_metric == "mean_f1":
             selection_score = (validation_response_f1 + validation_streaming_f1) / 2
         else:
             selection_score = (validation_response_ap + validation_streaming_ap) / 2
+
         row = {
             "epoch": epoch,
             "learning_rate": learning_rate,
@@ -360,7 +418,10 @@ def main():
         scheduler.step(validation_losses["loss"])
         updated_learning_rate = float(optimizer.param_groups[0]["lr"])
         if updated_learning_rate < learning_rate:
-            print(f"           validation loss plateau: reducing lr to {updated_learning_rate:.1e}", flush=True)
+            print(
+                f"           validation loss plateau: reducing lr to {updated_learning_rate:.1e}",
+                flush=True,
+            )
 
         if selection_score > best_selection_score + 1e-6:
             best_selection_score = selection_score
@@ -377,8 +438,11 @@ def main():
                 print(f"  early stopping after epoch {epoch}", flush=True)
                 break
 
+    if best_state is None:
+        raise RuntimeError("training did not produce a classifier checkpoint")
     model.load_state_dict(best_state, strict=True)
 
+    # Select response and streaming thresholds on the validation split.
     validation_scores = score_sequences(model, validation, args.batch_size, device)
     thresholds = {
         "response": select_thresholds(validation_scores["labels"], validation_scores["response_scores"]),
@@ -386,10 +450,10 @@ def main():
     }
     validation_report = threshold_report(validation_scores, thresholds)
     saved_arguments = vars(args).copy()
+    saved_arguments.pop("run_path_file", None)
+
     config = {
         **saved_arguments,
-        **{key: value for key, value in read_activation_cache_info(activation_cache).items()
-           if key == "base_model"},
         "training_cache": str(activation_cache),
         "hazard_bias_initialization": hazard_bias,
         "split_seed": split_seed,
@@ -397,6 +461,10 @@ def main():
         "n_training_responses": len(train),
         "n_validation_responses": len(validation),
     }
+    cache_info = read_activation_cache_info(activation_cache)
+    if "base_model" in cache_info:
+        config["base_model"] = cache_info["base_model"]
+
     if uses_vq:
         config.update({
             "vq_run": str(vq_run),
@@ -407,6 +475,7 @@ def main():
             "code_score_source": code_statistics["score_source"],
             "code_score_method": code_statistics["score_method"],
             "code_vector_source": args.code_vector_source,
+            "prompt_conditioning": prompt_conditioning,
         })
         if args.code_vector_source == "activation_mean":
             config.update({
@@ -423,6 +492,13 @@ def main():
         else:
             config.pop("raw_projection_dim", None)
             config.pop("vq_projection_dim", None)
+        if prompt_conditioning:
+            config.update({
+                "prompt_activation_cache": str(prompt_cache_path),
+                "prompt_activation_layer": args.activation_layer,
+                "prompt_activation_dim": prompt_activation_dim,
+                "prompt_conditioning_method": "masked_attention_pool_to_gru_initial_state",
+            })
     else:
         config.update({"activation_dim": activation_dim})
         for irrelevant_name in (
@@ -431,7 +507,7 @@ def main():
         ):
             config.pop(irrelevant_name, None)
 
-    # AP and F1 describe the retained epoch, whichever metric selected it.
+    # Save both AP and F1 for the retained epoch, regardless of the selection metric.
     classifier_checkpoint = {
         "model": best_state,
         "config": config,
@@ -456,7 +532,7 @@ def main():
                 "code_vector_token_counts": code_vector_counts,
             })
     torch.save(classifier_checkpoint, run_dir / "classifier.pt")
-    json.dump(validation_report, open(run_dir / "validation_report.json", "w"), indent=2)
+    (run_dir / "validation_report.json").write_text(json.dumps(validation_report, indent=2) + "\n")
     training_summary = {
         "config": config,
         "best_epoch": best_epoch,
@@ -474,9 +550,12 @@ def main():
     if code_statistics is not None:
         training_summary["code_statistics"] = {
             name: value for name, value in code_statistics.items()
-            if name not in {"response_counts", "signed_harmfulness"}
+            if not isinstance(value, torch.Tensor)
         }
-    json.dump(training_summary, open(run_dir / "training_summary.json", "w"), indent=2)
+    (run_dir / "training_summary.json").write_text(json.dumps(training_summary, indent=2) + "\n")
+    if args.run_path_file:
+        Path(args.run_path_file).write_text(str(run_dir))
+
     print(f"\n  best epoch    : {best_epoch}", flush=True)
     print(f"  validation AP : response {best_response_ap:.4f}, streaming {best_streaming_ap:.4f}", flush=True)
     print(f"  selection     : {args.selection_metric} {best_selection_score:.4f}", flush=True)

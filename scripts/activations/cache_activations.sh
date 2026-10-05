@@ -9,14 +9,14 @@ read_layer=20
 target_layer=24
 cache_tag=paper
 
-python src/activations/cache_activations.py \
+python src/activations/build_cache.py \
     --dataset $dataset \
     --base-model $base_model \
     --data-set $train_set \
     --layers $read_layer $target_layer \
     --cache-tag $cache_tag
 
-python src/activations/cache_activations.py \
+python src/activations/build_cache.py \
     --dataset $dataset \
     --base-model $base_model \
     --data-set $test_set \

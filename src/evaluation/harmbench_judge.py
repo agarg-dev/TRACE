@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """Evaluate steering outputs with the HarmBench text classifier."""
+
 import argparse
 import json
 from pathlib import Path
@@ -87,15 +88,16 @@ def asr_table(items, verdicts, variants):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, help="intervention run dir holding intervene.json")
-    parser.add_argument("--bs", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--save_every", type=int, default=10, help="checkpoint harmbench.json every N batches")
     parser.add_argument("--labels", choices=("unsafe", "safe", "both"), default="both",
                         help="response-label stratum to judge (default: both)")
     parser.add_argument("--recipes", nargs="+", help="steering recipes to judge (default: all)")
-    parser.add_argument("--lams", type=float, nargs="+", help="steering strengths to judge (default: all)")
+    parser.add_argument("--lambdas", type=float, nargs="+", help="steering strengths to judge (default: all)")
     args = parser.parse_args()
     run_dir = Path(args.run)
 
+    # Load the official HarmBench classifier once for the complete run.
     tokenizer = AutoTokenizer.from_pretrained(str(HARMBENCH_MODEL_DIR))
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
@@ -104,24 +106,28 @@ def main():
         str(HARMBENCH_MODEL_DIR), dtype=torch.bfloat16, device_map="cuda"
     ).eval()
 
-    run = json.loads((run_dir / "intervene.json").read_text())
-    recipes = args.recipes or run["recipes"]
-    lams = args.lams or run["lams"]
-    variants = ["baseline"] + [f"{recipe}_lam{lam:g}" for recipe in recipes for lam in lams]
+    data = json.loads((run_dir / "intervene.json").read_text())
+    recipes = args.recipes or data["recipes"]
+    lambdas = args.lambdas or data["lambdas"]
+    unknown_recipes = sorted(set(recipes) - set(data["recipes"]))
+    unknown_lambdas = sorted(set(lambdas) - set(data["lambdas"]))
+    if unknown_recipes or unknown_lambdas:
+        raise ValueError(f"requested recipes/lambdas absent from intervene.json: "
+                         f"recipes={unknown_recipes}, lambdas={unknown_lambdas}")
+    variants = ["baseline"] + [f"{recipe}_lam{strength:g}" for recipe in recipes for strength in lambdas]
     selected_labels = {0, 1} if args.labels == "both" else {1 if args.labels == "unsafe" else 0}
+
+    # Flatten the requested baseline and steered responses into judge inputs.
     items = []
-    for row in run["results"]:
+    for row in data["results"]:
         if row["label"] not in selected_labels:
             continue
-        items.append({
-            "key": f"baseline|{row['idx']}", "variant": "baseline", "label": row["label"],
-            "prompt": row["prompt"], "text": row["baseline"]["text"],
-        })
+        items.append({"key": f"baseline|{row['idx']}", "variant": "baseline",
+                      "label": row["label"], "prompt": row["prompt"], "text": row["baseline"]["text"]})
         for variant in variants[1:]:
-            items.append({
-                "key": f"{variant}|{row['idx']}", "variant": variant, "label": row["label"],
-                "prompt": row["prompt"], "text": row["steered"][variant]["text"],
-            })
+            cell = row["steered"][variant]
+            items.append({"key": f"{variant}|{row['idx']}", "variant": variant,
+                          "label": row["label"], "prompt": row["prompt"], "text": cell["text"]})
 
     out_path = run_dir / "harmbench.json"
     store = json.loads(out_path.read_text()) if out_path.exists() else {
@@ -132,36 +138,31 @@ def main():
     }
     if store.get("protocol") != JUDGE_PROTOCOL:
         raise ValueError(
-            f"{out_path} contains verdicts from a different HarmBench protocol; "
-            "use a new run directory for this protocol"
+            f"{out_path} contains verdicts from an older HarmBench protocol; "
+            "keep that artifact and use a new run directory for the official protocol"
         )
     verdicts = store["verdicts"]
-    pending_items = [item for item in items if item["key"] not in verdicts]
+    todo = [item for item in items if item["key"] not in verdicts]
     print(
-        f"{len(items)} completions | {len(items) - len(pending_items)} cached | "
-        f"{len(pending_items)} to judge (bs={args.bs})",
+        f"{len(items)} completions | {len(items) - len(todo)} cached | "
+        f"{len(todo)} to judge (batch size {args.batch_size})",
         flush=True,
     )
 
+    # Save verdicts periodically so an interrupted judge run can resume.
     def save():
         store["table"] = asr_table(items, verdicts, variants)
-        with out_path.open("w") as output_file:
-            json.dump(store, output_file, indent=2)
+        out_path.write_text(json.dumps(store, indent=2) + "\n")
 
-    for batch_no, start in enumerate(range(0, len(pending_items), args.bs)):
-        batch = pending_items[start:start + args.bs]
-        batch_verdicts = classify(
-            model, tokenizer, [item["prompt"] for item in batch],
-            [item["text"] for item in batch],
-        )
-        for item, flag in zip(batch, batch_verdicts):
+    for batch_no, start in enumerate(range(0, len(todo), args.batch_size)):
+        batch = todo[start:start + args.batch_size]
+        harmful = classify(model, tokenizer, [item["prompt"] for item in batch],
+                           [item["text"] for item in batch])
+        for item, flag in zip(batch, harmful):
             verdicts[item["key"]] = bool(flag)
         if (batch_no + 1) % args.save_every == 0:
             save()
-            print(
-                f"  {min(start + args.bs, len(pending_items))}/{len(pending_items)} judged",
-                flush=True,
-            )
+            print(f"  {min(start + args.batch_size, len(todo))}/{len(todo)} judged", flush=True)
     save()
 
     table = store["table"]
@@ -173,14 +174,14 @@ def main():
     if base["originally_safe_response_harm_rate"] is not None:
         print("  baseline harm rate (original response safe) = "
               f"{base['originally_safe_response_harm_rate']:.2f}")
-    print(f"\n    {'recipe':<22}" + "".join(f"lam{lam:g}".rjust(8) for lam in lams)
+    print(f"\n    {'recipe':<22}" + "".join(f"lam{strength:g}".rjust(8) for strength in lambdas)
           + "   (ASR; lower=better)")
     for recipe in recipes:
-        cells = "".join(
-            (f"{table[f'{recipe}_lam{lam:g}']['asr_unsafe']:.2f}"
-             if table[f"{recipe}_lam{lam:g}"]["asr_unsafe"] is not None else "-").rjust(8)
-            for lam in lams
-        )
+        cells = ""
+        for strength in lambdas:
+            result = table[f"{recipe}_lam{strength:g}"]
+            value = f"{result['asr_unsafe']:.2f}" if result["asr_unsafe"] is not None else "-"
+            cells += value.rjust(8)
         print(f"    {recipe:<22}{cells}")
     print(f"\n  -> {out_path}", flush=True)
 

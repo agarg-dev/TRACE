@@ -1,9 +1,5 @@
 #!/usr/bin/env python
-"""Build a larger deduplicated model-specific WildGuard pool for detector training.
-
-The source datasets and the curated VQ training pool are read-only inputs. The derived pool is written
-under ``data/<dataset>/classifier_training`` and keeps one response per normalized prompt.
-"""
+"""Build the deduplicated WildGuard detector-training pool."""
 
 import argparse
 import json
@@ -12,11 +8,12 @@ from pathlib import Path
 import pandas as pd
 from datasets import load_from_disk
 
-from project_config import DEFAULT_DATASET, dataset_path
+from data.dataset_splits import DEFAULT_DATASET
+from project_config import DATA_ROOT
 
 
 def normalize_text(text):
-    return " ".join(text.split()).casefold()
+    return " ".join((text or "").split()).casefold()
 
 
 def response_class(row):
@@ -32,7 +29,8 @@ def main():
     parser.add_argument("--out", help="default: data/<dataset>/classifier_training/train_deduplicated.jsonl")
     args = parser.parse_args()
 
-    data_dir = dataset_path(args.dataset)
+    # Normalize and deduplicate the source responses.
+    data_dir = DATA_ROOT / args.dataset
     dataset = load_from_disk(str(data_dir / "raw_enriched"))["train"]
     columns = ["prompt", "response", "label", "subcategory", "prompt_harm_label", "adversarial"]
     frame = pd.DataFrame({column: dataset[column] for column in columns})
@@ -53,13 +51,19 @@ def main():
     frame = frame.sort_values(["class_priority", "idx"])
     frame = frame.drop_duplicates("normalized_prompt", keep="first").reset_index(drop=True)
 
+    # Match refusal and benign examples to the harmful class size.
     by_class = {name: frame[frame.cls == name] for name in class_priority}
     examples_per_class = len(by_class["harmful"])
+    if any(len(group) < examples_per_class for group in by_class.values()):
+        counts = {name: len(group) for name, group in by_class.items()}
+        raise ValueError(f"not enough safe examples to match all harmful examples: {counts}")
+
     selected = [by_class["harmful"]]
     selected += [by_class[name].sample(examples_per_class, random_state=args.seed)
                  for name in ("refusal", "benign")]
     pool = pd.concat(selected, ignore_index=True).sample(frac=1, random_state=args.seed).reset_index(drop=True)
 
+    # Save the selected pool and a record of the selection counts.
     output_path = Path(args.out) if args.out else data_dir / "classifier_training/train_deduplicated.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     keep = ["idx", "prompt", "response", "label", "subcategory", "prompt_harm_label", "adversarial", "cls"]

@@ -1,9 +1,4 @@
-"""Causal harmfulness classifiers, data preparation, training helpers, and metrics.
-
-The VQ assigns one code to each generated token. This module combines its frozen codebook vector with
-training-only code statistics, projects it to a compact space, and maintains a causal GRU state. Separate
-heads support final-response classification and cumulative online harm risk.
-"""
+"""Causal sequence detectors and their training and evaluation helpers."""
 
 import numpy as np
 import torch
@@ -17,9 +12,10 @@ from model_inputs import pad_activation_sequences
 from vq.codebook import smoothed_response_code_statistics
 
 
-def _run_causal_gru(gru, inputs, lengths, total_length):
+def _run_causal_gru(gru, inputs, lengths, total_length, initial_state=None):
     packed = pack_padded_sequence(inputs, lengths.cpu(), batch_first=True, enforce_sorted=False)
-    packed_outputs, _ = gru(packed)
+    # Keep the original call path unchanged when no prompt state is supplied.
+    packed_outputs, _ = gru(packed) if initial_state is None else gru(packed, initial_state)
     outputs, _ = pad_packed_sequence(packed_outputs, batch_first=True, total_length=total_length)
     return outputs
 
@@ -29,7 +25,7 @@ class CodeSequenceClassifier(nn.Module):
 
     def __init__(
         self, codebook, code_features, projection_dim=128, hidden_dim=128, num_layers=1,
-        dropout=0.1, hazard_bias=-7.0, harmfulness_score_weight=0.0,
+        dropout=0.1, hazard_bias=-7.0, harmfulness_score_weight=0.0, prompt_conditioning=False,
     ):
         super().__init__()
         codebook = torch.as_tensor(codebook, dtype=torch.float32).detach().clone()
@@ -40,11 +36,21 @@ class CodeSequenceClassifier(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.harmfulness_score_weight = float(harmfulness_score_weight)
+        self.prompt_conditioning = bool(prompt_conditioning)
         self.register_buffer("codebook", codebook, persistent=False)
         self.register_buffer("code_features", code_features, persistent=False)
         self.code_projection = nn.Linear(self.codebook_dim, projection_dim)
         self.input_norm = nn.LayerNorm(projection_dim)
         self.input_dropout = nn.Dropout(dropout)
+        if self.prompt_conditioning:
+            self.prompt_projection = nn.Linear(self.codebook_dim, projection_dim)
+            self.prompt_norm = nn.LayerNorm(projection_dim)
+            self.prompt_attention = nn.Linear(projection_dim, 1)
+            self.prompt_state_projection = nn.Linear(projection_dim, num_layers * hidden_dim)
+            nn.init.zeros_(self.prompt_attention.weight)
+            nn.init.zeros_(self.prompt_attention.bias)
+            nn.init.xavier_uniform_(self.prompt_state_projection.weight, gain=0.1)
+            nn.init.zeros_(self.prompt_state_projection.bias)
         self.gru = nn.GRU(
             projection_dim + self.code_feature_dim, hidden_dim, num_layers=num_layers, batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0, bidirectional=False,
@@ -54,14 +60,34 @@ class CodeSequenceClassifier(nn.Module):
         nn.init.zeros_(self.hazard_head.weight)
         nn.init.constant_(self.hazard_head.bias, hazard_bias)
 
+    def prompt_initial_state(self, prompt_activations, prompt_lengths):
+        """Attention-pool the known prompt into the GRU state used before response token one."""
+        prompt_activations = prompt_activations.to(dtype=self.prompt_projection.weight.dtype)
+        projected_prompt = self.prompt_norm(self.prompt_projection(prompt_activations))
+        attention_logits = self.prompt_attention(projected_prompt).squeeze(-1).float()
+        positions = torch.arange(prompt_activations.shape[1], device=prompt_activations.device)
+        prompt_mask = positions.unsqueeze(0) < prompt_lengths.unsqueeze(1)
+        attention_weights = attention_logits.masked_fill(~prompt_mask, -torch.inf).softmax(dim=1)
+        pooled_prompt = torch.sum(attention_weights.unsqueeze(-1) * projected_prompt.float(), dim=1)
+        initial_state = torch.tanh(self.prompt_state_projection(pooled_prompt))
+        return initial_state.view(-1, self.num_layers, self.hidden_dim).transpose(0, 1).contiguous()
+
     def forward(self, inputs, lengths):
         """Return per-token logits and a valid-token mask for padded code-ID sequences."""
-        code_ids = inputs
-        # Project K vectors once, then apply dropout after gathering so repeated codes receive tokenwise masks.
+        if self.prompt_conditioning:
+            code_ids, prompt_activations, prompt_lengths = inputs
+        else:
+            code_ids = inputs
+
+        # Project the codebook once, then apply independent dropout after lookup.
         projected_codebook = self.input_norm(self.code_projection(self.codebook))
         projected_sequence = self.input_dropout(projected_codebook[code_ids])
         inputs = torch.cat([projected_sequence, self.code_features[code_ids]], dim=-1)
-        outputs = _run_causal_gru(self.gru, inputs, lengths, code_ids.shape[1])
+        initial_state = (
+            self.prompt_initial_state(prompt_activations, prompt_lengths)
+            if self.prompt_conditioning else None
+        )
+        outputs = _run_causal_gru(self.gru, inputs, lengths, code_ids.shape[1], initial_state)
         response_logits = self.response_head(outputs)
         hazard_logits = self.hazard_head(outputs).squeeze(-1)
         hazard_logits = hazard_logits + self.harmfulness_score_weight * self.code_features[code_ids, 0]
@@ -131,7 +157,7 @@ class HybridSequenceClassifier(nn.Module):
     def __init__(
         self, activation_dim, codebook, code_features, raw_projection_dim=256,
         vq_projection_dim=256, hidden_dim=64, num_layers=1, dropout=0.1,
-        hazard_bias=-7.0, harmfulness_score_weight=1.0,
+        hazard_bias=-7.0, harmfulness_score_weight=1.0, prompt_conditioning=False,
     ):
         super().__init__()
         codebook = torch.as_tensor(codebook, dtype=torch.float32).detach().clone()
@@ -144,6 +170,7 @@ class HybridSequenceClassifier(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.harmfulness_score_weight = float(harmfulness_score_weight)
+        self.prompt_conditioning = bool(prompt_conditioning)
         self.register_buffer("codebook", codebook, persistent=False)
         self.register_buffer("code_features", code_features, persistent=False)
 
@@ -152,6 +179,13 @@ class HybridSequenceClassifier(nn.Module):
         self.raw_norm = nn.LayerNorm(raw_projection_dim)
         self.vq_norm = nn.LayerNorm(vq_projection_dim)
         self.input_dropout = nn.Dropout(dropout)
+        if self.prompt_conditioning:
+            self.prompt_attention = nn.Linear(raw_projection_dim, 1)
+            self.prompt_state_projection = nn.Linear(raw_projection_dim, num_layers * hidden_dim)
+            nn.init.zeros_(self.prompt_attention.weight)
+            nn.init.zeros_(self.prompt_attention.bias)
+            nn.init.xavier_uniform_(self.prompt_state_projection.weight, gain=0.1)
+            nn.init.zeros_(self.prompt_state_projection.bias)
         gru_input_dim = raw_projection_dim + vq_projection_dim + self.code_feature_dim
         self.gru = nn.GRU(
             gru_input_dim, hidden_dim, num_layers=num_layers, batch_first=True,
@@ -166,14 +200,28 @@ class HybridSequenceClassifier(nn.Module):
         activations = activations.to(dtype=self.raw_projection.weight.dtype)
         return self.input_dropout(self.raw_norm(self.raw_projection(activations)))
 
+    def prompt_initial_state(self, prompt_activations, prompt_lengths):
+        """Attention-pool the known prompt into the GRU state used before response token one."""
+        prompt_activations = prompt_activations.to(dtype=self.raw_projection.weight.dtype)
+        projected_prompt = self.raw_norm(self.raw_projection(prompt_activations))
+        attention_logits = self.prompt_attention(projected_prompt).squeeze(-1).float()
+        positions = torch.arange(prompt_activations.shape[1], device=prompt_activations.device)
+        prompt_mask = positions.unsqueeze(0) < prompt_lengths.unsqueeze(1)
+        attention_weights = attention_logits.masked_fill(~prompt_mask, -torch.inf).softmax(dim=1)
+        pooled_prompt = torch.sum(attention_weights.unsqueeze(-1) * projected_prompt.float(), dim=1)
+        initial_state = torch.tanh(self.prompt_state_projection(pooled_prompt))
+        initial_state = initial_state.view(-1, self.num_layers, self.hidden_dim).transpose(0, 1).contiguous()
+        return initial_state
+
     def forward(self, inputs, lengths):
         """Return per-token logits for aligned raw-activation and VQ-code sequences."""
-        activations, code_ids = inputs
+        activations, code_ids = inputs[:2]
         raw_sequence = self._project_raw(activations)
         projected_codebook = self.vq_norm(self.vq_projection(self.codebook))
         vq_sequence = self.input_dropout(projected_codebook[code_ids])
         gru_inputs = torch.cat([raw_sequence, vq_sequence, self.code_features[code_ids]], dim=-1)
-        outputs = _run_causal_gru(self.gru, gru_inputs, lengths, code_ids.shape[1])
+        initial_state = self.prompt_initial_state(inputs[2], inputs[3]) if self.prompt_conditioning else None
+        outputs = _run_causal_gru(self.gru, gru_inputs, lengths, code_ids.shape[1], initial_state)
         response_logits = self.response_head(outputs)
         hazard_logits = self.hazard_head(outputs).squeeze(-1)
         hazard_logits = hazard_logits + self.harmfulness_score_weight * self.code_features[code_ids, 0]
@@ -221,20 +269,20 @@ def streaming_classification_loss(
     gives the probability that harm has appeared by the end of the response, without choosing a fixed
     temporal window.
     """
-    response_loss = F.cross_entropy(final_token_logits(response_logits, lengths), labels, weight=class_weights)
+    final_logits = final_token_logits(response_logits, lengths)
+    response_loss = F.cross_entropy(final_logits, labels, weight=class_weights)
     log_survival_terms = F.logsigmoid(-hazard_logits.float()).masked_fill(~valid_mask, 0.0)
     log_survival = log_survival_terms.sum(dim=1)
     harmful_risk = (-torch.expm1(log_survival)).clamp_min(1e-12)
     sequence_losses = torch.where(labels.bool(), -torch.log(harmful_risk), -log_survival)
-    sequence_weights = class_weights[labels] if class_weights is not None else torch.ones_like(sequence_losses)
+    if class_weights is None:
+        sequence_weights = torch.ones_like(sequence_losses)
+    else:
+        sequence_weights = class_weights[labels]
     streaming_loss = (sequence_losses * sequence_weights).sum() / sequence_weights.sum()
 
     total = response_weight * response_loss + streaming_weight * streaming_loss
-    return {
-        "loss": total,
-        "response": response_loss,
-        "streaming": streaming_loss,
-    }
+    return {"loss": total, "response": response_loss, "streaming": streaming_loss}
 
 
 @torch.no_grad()
@@ -280,10 +328,10 @@ def assign_hybrid_sequences(vq_model, activation_sequences, device, batch_size=1
     return hybrid_sequences
 
 
-def activation_mean_code_vectors(sequences, codebook_vectors):
-    """Average training activations assigned to each code and retain unused codebook vectors."""
-    codebook_vectors = torch.as_tensor(codebook_vectors, dtype=torch.float32).detach().cpu()
-    num_codes, activation_dim = codebook_vectors.shape
+def activation_mean_code_vectors(sequences, fallback_vectors):
+    """Average training activations assigned to each code, falling back for unused codes."""
+    fallback_vectors = torch.as_tensor(fallback_vectors, dtype=torch.float32).detach().cpu()
+    num_codes, activation_dim = fallback_vectors.shape
     vector_sums = torch.zeros(num_codes, activation_dim, dtype=torch.float32)
     token_counts = torch.zeros(num_codes, dtype=torch.long)
     for sequence in sequences:
@@ -294,14 +342,65 @@ def activation_mean_code_vectors(sequences, codebook_vectors):
 
     code_vectors = vector_sums / token_counts.clamp(min=1).unsqueeze(1)
     unused_codes = token_counts == 0
-    code_vectors[unused_codes] = codebook_vectors[unused_codes]
+    code_vectors[unused_codes] = fallback_vectors[unused_codes]
     return code_vectors, token_counts
+
+
+def attach_prompt_activations(response_sequences, prompt_sequences):
+    """Attach one checked prompt-activation sequence to every response sequence."""
+    prompts_by_id = {prompt["idx"]: prompt for prompt in prompt_sequences}
+    attached = []
+    for sequence in response_sequences:
+        prompt = prompts_by_id[sequence["idx"]]
+        if prompt["label"] != sequence["label"]:
+            raise ValueError(f"prompt and response labels differ for response {sequence['idx']}")
+        combined = dict(sequence)
+        combined["prompt_activations"] = prompt["x"]
+        attached.append(combined)
+    return attached
 
 
 def sequence_length(sequence):
     """Return the token count for either a VQ-code or raw-activation sequence."""
-    key = "codes" if "codes" in sequence else "x"
-    return len(sequence[key])
+    if "codes" in sequence:
+        return len(sequence["codes"])
+    return len(sequence["x"])
+
+
+def code_feature_statistics(sequences, num_codes, prior_strength=10.0):
+    """Estimate signed code harmfulness from response-level presence in the classifier training split.
+
+    A repeated code contributes once per response when its global association is estimated. Its repeated
+    occurrences remain in the code sequence seen by the GRU. An empirical-Bayes prior prevents codes seen
+    in only a few responses from receiving extreme scores.
+    """
+    statistics = smoothed_response_code_statistics(
+        (sequence["codes"].cpu().numpy() for sequence in sequences),
+        (sequence["label"] for sequence in sequences), num_codes, prior_strength,
+    )
+    code_features = torch.tensor(
+        np.stack([
+            statistics["signed_harmfulness"], statistics["normalized_log_response_support"]
+        ], axis=1), dtype=torch.float32
+    )
+    serialized_statistics = {
+        "feature_names": ["signed_response_harmfulness", "normalized_log_response_support"],
+        "source": "classifier training split only",
+        "score_method": "smoothed response-presence enrichment relative to the harmful-response base rate",
+        "prior_strength": statistics["prior_strength"],
+        "base_harmful_response_rate": statistics["base_harmful_response_rate"],
+        "n_training_responses": statistics["n_responses"],
+        "n_harmful_responses": statistics["n_harmful_responses"],
+        "n_safe_responses": statistics["n_safe_responses"],
+        "n_unseen_codes": int((statistics["response_counts"] == 0).sum()),
+        "response_counts": torch.from_numpy(statistics["response_counts"]),
+        "harmful_response_counts": torch.from_numpy(statistics["harmful_response_counts"]),
+        "smoothed_harmful_probability": torch.from_numpy(
+            statistics["smoothed_harmful_probability"].astype(np.float32)
+        ),
+        "signed_harmfulness": torch.from_numpy(statistics["signed_harmfulness"].astype(np.float32)),
+    }
+    return code_features, serialized_statistics
 
 
 def rescore_no_task_checkpoint_by_response_presence(sequences, num_codes, checkpoint_config,
@@ -309,17 +408,10 @@ def rescore_no_task_checkpoint_by_response_presence(sequences, num_codes, checkp
     """Derive presence scores from the exact VQ-training partition of a no-task checkpoint."""
     if float(checkpoint_config.get("task_weight", -1)) != 0:
         raise ValueError("response-presence rescoring is restricted to checkpoints trained without task loss")
-    if checkpoint_config.get("split_scheme") != "nested_90_5_5":
-        raise ValueError("response-presence rescoring requires the nested VQ split")
 
     seed = int(checkpoint_config.get("seed", 42))
     detector_training, _ = train_validation_split(sequences, seed)
     vq_training, _ = train_validation_split(detector_training, seed)
-    expected_count = checkpoint_config.get("split_partition_counts", {}).get("vq_train")
-    if expected_count is not None and len(vq_training) != int(expected_count):
-        raise ValueError(
-            f"reconstructed VQ-training partition has {len(vq_training)} responses, expected {expected_count}"
-        )
 
     statistics = smoothed_response_code_statistics(
         (sequence["codes"].cpu().numpy() for sequence in vq_training),
@@ -340,7 +432,9 @@ def rescore_no_task_checkpoint_by_response_presence(sequences, num_codes, checkp
     }
 
 
-def checkpoint_code_feature_statistics(checkpoint_regions, sequences, num_codes, expected_prior_strength=10.0):
+def checkpoint_code_feature_statistics(
+    checkpoint_regions, sequences, num_codes, expected_prior_strength=10.0,
+):
     """Build classifier features from the harmfulness score stored in a VQ checkpoint.
 
     Harmfulness is never re-estimated from classifier labels. The second feature is unlabeled response
@@ -348,7 +442,7 @@ def checkpoint_code_feature_statistics(checkpoint_regions, sequences, num_codes,
     changing what that code's harmfulness score means.
     """
     score_method = checkpoint_regions.get("score_method")
-    if score_method != "response_presence":
+    if score_method not in {"response_presence", "response_frequency"}:
         raise ValueError(
             "the classifier requires a VQ checkpoint with response-based code scores; "
             f"found {score_method!r}"
@@ -395,7 +489,11 @@ def sequence_batches(sequences, batch_size, shuffle, seed):
 
 def pad_code_batch(sequences, device):
     """Pad code IDs and return tensors plus the untouched sequence metadata."""
-    lengths = torch.tensor([len(sequence["codes"]) for sequence in sequences], dtype=torch.long, device=device)
+    lengths = torch.tensor(
+        [len(sequence["codes"]) for sequence in sequences],
+        dtype=torch.long,
+        device=device,
+    )
     max_length = int(lengths.max().item())
     code_ids = torch.zeros(len(sequences), max_length, dtype=torch.long, device=device)
     for row, sequence in enumerate(sequences):
@@ -425,6 +523,40 @@ def pad_hybrid_batch(sequences, device):
     for row, sequence in enumerate(sequences):
         code_ids[row, :len(sequence["codes"])] = sequence["codes"].to(device)
     return (activations, code_ids), lengths, labels
+
+
+def pad_prompt_conditioned_code_batch(sequences, device):
+    """Pad VQ response codes and their separately cached prompt activations."""
+    code_ids, lengths, labels = pad_code_batch(sequences, device)
+    prompt_lengths = torch.tensor(
+        [len(sequence["prompt_activations"]) for sequence in sequences], dtype=torch.long, device=device
+    )
+    max_prompt_length = int(prompt_lengths.max().item())
+    prompt_dim = sequences[0]["prompt_activations"].shape[1]
+    prompt_activations = torch.zeros(
+        len(sequences), max_prompt_length, prompt_dim, dtype=sequences[0]["prompt_activations"].dtype
+    )
+    for row, sequence in enumerate(sequences):
+        prompt = sequence["prompt_activations"]
+        prompt_activations[row, :len(prompt)] = prompt
+    return (code_ids, prompt_activations.to(device), prompt_lengths), lengths, labels
+
+
+def pad_prompt_conditioned_hybrid_batch(sequences, device):
+    """Pad response and prompt activations independently for a prompt-conditioned hybrid batch."""
+    (activations, code_ids), lengths, labels = pad_hybrid_batch(sequences, device)
+    prompt_lengths = torch.tensor(
+        [len(sequence["prompt_activations"]) for sequence in sequences], dtype=torch.long, device=device
+    )
+    max_prompt_length = int(prompt_lengths.max().item())
+    prompt_dim = sequences[0]["prompt_activations"].shape[1]
+    prompt_activations = torch.zeros(
+        len(sequences), max_prompt_length, prompt_dim, dtype=sequences[0]["prompt_activations"].dtype
+    )
+    for row, sequence in enumerate(sequences):
+        prompt = sequence["prompt_activations"]
+        prompt_activations[row, :len(prompt)] = prompt
+    return (activations, code_ids, prompt_activations.to(device), prompt_lengths), lengths, labels
 
 
 def metrics_at_threshold(labels, scores, threshold):
@@ -551,14 +683,15 @@ def _score_sequences(model, sequences, batch_size, device, pad_batch, include_to
 
 def score_code_sequences(model, sequences, batch_size, device, include_token_details=False):
     """Score VQ code-ID sequences."""
+    pad_batch = pad_prompt_conditioned_code_batch if model.prompt_conditioning else pad_code_batch
     return _score_sequences(
-        model, sequences, batch_size, device, pad_code_batch,
+        model, sequences, batch_size, device, pad_batch,
         include_token_details=include_token_details,
     )
 
 
 def score_activation_sequences(model, sequences, batch_size, device, include_token_details=False):
-    """Score read-layer activation sequences."""
+    """Score raw layer-24 activation sequences."""
     return _score_sequences(
         model, sequences, batch_size, device, pad_activation_batch,
         include_token_details=include_token_details,
@@ -573,26 +706,38 @@ def score_hybrid_sequences(model, sequences, batch_size, device, include_token_d
     )
 
 
-def evaluate_loss(model, sequences, batch_size, response_weight, streaming_weight,
-                  class_weights, device, pad_batch):
+def score_prompt_conditioned_hybrid_sequences(
+    model, sequences, batch_size, device, include_token_details=False,
+):
+    """Score hybrid response sequences initialized from their prompt activations."""
+    return _score_sequences(
+        model, sequences, batch_size, device, pad_prompt_conditioned_hybrid_batch,
+        include_token_details=include_token_details,
+    )
+
+
+def evaluate_loss(model, sequences, args, class_weights, device, pad_batch):
     """Average classifier losses by response weight across the evaluation partition."""
     model.eval()
     totals = {"loss": 0.0, "response": 0.0, "streaming": 0.0}
     total_weight = 0.0
     with torch.no_grad():
-        for batch in sequence_batches(sequences, batch_size, shuffle=False, seed=0):
+        for batch in sequence_batches(sequences, args.batch_size, shuffle=False, seed=0):
             inputs, lengths, labels = pad_batch(batch, device)
             response_logits, hazard_logits, valid_mask = model(inputs, lengths)
             losses = streaming_classification_loss(
                 response_logits, hazard_logits, valid_mask, lengths, labels, class_weights,
-                response_weight, streaming_weight,
+                args.response_weight, args.streaming_weight,
             )
             # Both heads return a mean normalized by this batch's response-class weights.
-            batch_weight = float(class_weights[labels].sum().item()) if class_weights is not None else len(batch)
+            if class_weights is None:
+                batch_weight = len(batch)
+            else:
+                batch_weight = float(class_weights[labels].sum().item())
             for name in totals:
                 totals[name] += float(losses[name].item()) * batch_weight
             total_weight += batch_weight
-    return {name: value / total_weight for name, value in totals.items()}
+    return {name: value / total_weight if total_weight else 0.0 for name, value in totals.items()}
 
 
 def threshold_report(scored, thresholds):

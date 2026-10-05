@@ -11,6 +11,10 @@ output_dir=output/runs/steering/qwen_wildguard
 audit_cache=output/runs/analysis/steering_cache
 method=additive_renorm_gate
 strength=0.75
+concept=code_mean
+counterpart_selection=fixed
+min_benign_response_support=10
+code_score_prior_strength=10
 max_new_tokens=2048
 batch_size=8
 
@@ -24,6 +28,10 @@ python src/steering/run_steering.py \
     --checkpoint $checkpoint \
     --methods $method \
     --lambdas $strength \
+    --concept $concept \
+    --counterpart-selection $counterpart_selection \
+    --min-benign-response-support $min_benign_response_support \
+    --code-score-prior-strength $code_score_prior_strength \
     --max-new-tokens $max_new_tokens \
     --batch-size $batch_size \
     --audit-cache-out $audit_cache

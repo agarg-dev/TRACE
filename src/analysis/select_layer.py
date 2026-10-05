@@ -1,12 +1,10 @@
 #!/usr/bin/env python
-"""Select a read layer with probes on final response-token activations.
-
-Probes use balanced training responses and five-fold cross-validation.
-"""
+"""Select a generator layer using held-out linear-probe accuracy."""
 
 import argparse
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 import sklearn
@@ -23,25 +21,38 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold
 from transformers import AutoModel, AutoTokenizer
 
-from data.dataset_splits import training_split
+from data.dataset_splits import DEFAULT_DATASET, training_split
 from model_inputs import (
-    configure_transformers_compatibility, format_prompt_token_ids, initialize_internlm3_rotary_embeddings,
+    restore_transformers_loss_kwargs, format_prompt_token_ids, repair_internlm3_rotary_embeddings,
 )
 from project_config import (
     DEFAULT_BASE_MODEL,
-    DEFAULT_DATASET,
     DETECTION_RUNS_DIR,
-    base_model_path,
-    resolve_project_path,
+    MODEL_DIR,
 )
+
+
+ITI_PAPER = "https://proceedings.neurips.cc/paper_files/paper/2023/file/81b8390039b7302c909cb769f8b6cd93-Paper-Conference.pdf"
+HARMFULNESS_PAPER = "https://proceedings.neurips.cc/paper_files/paper/2025/file/cd18539787d90e1d682d557c2c71b534-Paper-Conference.pdf"
+
+
+def load_rows(source):
+    if source.suffix == ".json":
+        with source.open() as source_file:
+            return json.load(source_file)
+    with source.open() as source_file:
+        return [json.loads(line) for line in source_file]
 
 
 def balanced_sample(rows, samples_per_class, seed):
     """Choose the same number of non-empty safe and harmful responses deterministically."""
-    groups = {
-        label: [row for row in rows if row["label"] == label and row["response"].strip()]
-        for label in (0, 1)
-    }
+    if samples_per_class < 1:
+        raise ValueError("samples per class must be positive")
+    groups = {0: [], 1: []}
+    for row in rows:
+        label = int(row.get("label", -1))
+        if label in groups and row.get("response", "").strip():
+            groups[label].append(row)
     for label, group in groups.items():
         if len(group) < samples_per_class:
             raise ValueError(
@@ -73,6 +84,8 @@ def candidate_hidden_state_indices(num_hidden_layers, requested_layers=None, tar
             f"read layers must be in [1, {last_candidate}] so their layer + {target_offset} "
             f"reconstruction target exists; got {invalid}"
         )
+    if not layers:
+        raise ValueError("at least one candidate layer is required")
     return layers
 
 
@@ -105,6 +118,10 @@ def extract_final_activations(
         input_ids = torch.tensor([prompt_token_ids + response_token_ids], device=device)
         with torch.inference_mode():
             hidden_states = model(input_ids=input_ids, output_hidden_states=True, use_cache=False).hidden_states
+        if max(layers) >= len(hidden_states):
+            raise ValueError(
+                f"requested hidden-state index {max(layers)}, but the model returned {len(hidden_states)} states"
+            )
 
         final_tensor = torch.stack([hidden_states[layer][0, final_position, :] for layer in layers], dim=0)
         activations[example_index] = final_tensor.float().cpu().numpy()
@@ -150,13 +167,13 @@ def evaluate_layers(activations, labels, layers, folds, seed):
             response_metrics = _binary_metrics(labels[validation_indices], response_scores)
             fold_results.append({"fold": fold, "response": response_metrics})
 
-        summary = {
-            metric: {
-                "mean": float(np.mean([fold_result["response"][metric] for fold_result in fold_results])),
-                "std": float(np.std([fold_result["response"][metric] for fold_result in fold_results])),
+        summary = {}
+        for metric in fold_results[0]["response"]:
+            values = [fold_result["response"][metric] for fold_result in fold_results]
+            summary[metric] = {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
             }
-            for metric in fold_results[0]["response"]
-        }
         results.append({"layer": layer, "response": summary, "folds": fold_results})
         print(
             f"  layer {layer:>2}: accuracy {summary['accuracy']['mean']:.3f} "
@@ -165,6 +182,32 @@ def evaluate_layers(activations, labels, layers, folds, seed):
         )
 
     return results
+
+
+def select_layer(layer_results):
+    """Maximize ITI's held-out accuracy objective; exact ties prefer the earlier layer."""
+    return max(layer_results, key=lambda result: (result["response"]["accuracy"]["mean"], -result["layer"]))
+
+
+def selection_stability(layer_results):
+    """Summarize whether the cross-validation folds agree on the selected layer."""
+    fold_count = len(layer_results[0]["folds"])
+    winners = []
+    for fold in range(fold_count):
+        winner = max(
+            layer_results,
+            key=lambda result: (
+                result["folds"][fold]["response"]["accuracy"],
+                -result["layer"],
+            ),
+        )
+        winners.append(winner["layer"])
+    return {
+        "fold_winners": winners,
+        "fold_win_counts": {
+            str(layer): winners.count(layer) for layer in sorted(set(winners))
+        },
+    }
 
 
 def parse_args():
@@ -184,36 +227,30 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.max_response_tokens < 1:
+        raise ValueError("max response tokens must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("layer selection requires a GPU compute node")
 
-    training_data = training_split(args.train_set, args.dataset)
-    with training_data.source.open() as source_file:
-        rows = [json.loads(line) for line in source_file]
-    sampled_rows = balanced_sample(
-        rows, args.samples_per_class, args.seed
-    )
-    model_path = base_model_path(args.base_model)
-    configure_transformers_compatibility()
+    data = training_split(args.train_set, args.dataset)
+    rows = balanced_sample(load_rows(data.source), args.samples_per_class, args.seed)
+    model_path = MODEL_DIR / args.base_model
+    restore_transformers_loss_kwargs()
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
     model = AutoModel.from_pretrained(
         str(model_path), dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True
     ).eval()
-    initialize_internlm3_rotary_embeddings(model)
+    repair_internlm3_rotary_embeddings(model)
     layers = candidate_hidden_state_indices(model.config.num_hidden_layers, args.layers, args.target_offset)
     run_dir = (
-        resolve_project_path(args.out)
+        Path(args.out)
         if args.out
         else DETECTION_RUNS_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_layer_selection_{args.dataset}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
-
     print("\nTRACE LAYER SELECTION", flush=True)
     print(f"  model          : {args.base_model} ({model.config.num_hidden_layers} transformer blocks)", flush=True)
-    print(
-        f"  calibration    : {args.dataset}/{training_data.name}; official test data is not used",
-        flush=True,
-    )
+    print(f"  calibration    : {args.dataset}/{data.name}; official test data is not used", flush=True)
     print(f"  balanced sample: {args.samples_per_class} safe + {args.samples_per_class} harmful", flush=True)
     candidate_description = (
         f"hidden_states[{layers[0]}] ... hidden_states[{layers[-1]}]"
@@ -227,25 +264,38 @@ def main():
 
     started_at = time.time()
     activations, labels, example_ids, response_lengths = extract_final_activations(
-        sampled_rows, tokenizer, model, layers, args.max_response_tokens, training_data.id_key
+        rows, tokenizer, model, layers, args.max_response_tokens, data.id_key
     )
     del model
     torch.cuda.empty_cache()
     layer_results = evaluate_layers(activations, labels, layers, args.folds, args.seed)
+    selected = select_layer(layer_results)
     ranked_layers = sorted(
         layer_results, key=lambda result: (-result["response"]["accuracy"]["mean"], result["layer"])
     )
-    selected = ranked_layers[0]
+    stability = selection_stability(layer_results)
+
     result = {
+        "schema_version": 2,
         "method": "final_token_layerwise_linear_probing",
+        "literature_basis": {
+            "probe_ranking": ITI_PAPER,
+            "harmfulness_is_distinct_from_refusal": HARMFULNESS_PAPER,
+            "adaptation": (
+                "Following ITI's temporal sampling and probe-ranking procedure, identical final-token "
+                "logistic probes are ranked by held-out accuracy. We replace ITI's single development "
+                "split with five-fold cross-validation and use harmful-response labels at residual "
+                "boundaries rather than truthful-answer labels at individual attention heads."
+            ),
+        },
         "config": {
             "dataset": args.dataset,
-            "train_set": training_data.name,
-            "source": str(training_data.source),
+            "train_set": data.name,
+            "source": str(data.source),
             "base_model": args.base_model,
             "seed": args.seed,
             "samples_per_class": args.samples_per_class,
-            "sample_size": len(sampled_rows),
+            "sample_size": len(rows),
             "max_response_tokens": args.max_response_tokens,
             "target_offset": args.target_offset,
             "folds": args.folds,
@@ -261,7 +311,7 @@ def main():
             "steering_hook_index": "L-1",
             "candidate_rule": (
                 "exclude embeddings and require hidden_states[L + target_offset] to exist for TRACE's "
-                "four-block reconstruction horizon"
+                "pre-existing four-block reconstruction horizon"
             ),
         },
         "sample_summary": {
@@ -285,6 +335,7 @@ def main():
                 - ranked_layers[1]["response"]["accuracy"]["mean"]
                 if len(ranked_layers) > 1 else None
             ),
+            **stability,
         },
         "layers": layer_results,
         "elapsed_seconds": time.time() - started_at,

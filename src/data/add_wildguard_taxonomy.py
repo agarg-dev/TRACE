@@ -1,37 +1,27 @@
 #!/usr/bin/env python
-"""Add WildGuard's prompt-level labels to a StreamGuardBench response dataset.
+"""Join WildGuard prompt metadata to model-specific response datasets."""
 
-StreamGuardBench ships only prompt/response/label. Its WildGuard prompts are exactly WildGuardMix's,
-so an exact prompt-string join recovers the prompt-level fields. Only prompt-level fields transfer:
-WildGuardMix response annotations describe different generations and are deliberately not copied.
-
-WildGuardMix is gated. Accept its terms and authenticate with Hugging Face
-before running this script.
-"""
 import argparse
 import json
+from pathlib import Path
 
 import pandas as pd
 from datasets import DatasetDict, load_from_disk
-from huggingface_hub import get_token, hf_hub_download
+from huggingface_hub import hf_hub_download
 
-from project_config import DATA_DIR, resolve_project_path
-
-DEFAULT_RAW = DATA_DIR / "raw"
-DEFAULT_DATASET_DIR = DATA_DIR
-DEFAULT_TAXONOMY_REVISION = "d29c47f41c8b51348b5c8e8c81c039b3132b66d1"
+from data.dataset_splits import DEFAULT_DATASET
+from project_config import DATA_ROOT
 
 # prompt_harm_label may be null when upstream annotators did not agree.
 FIELDS = {"subcategory": str, "prompt_harm_label": str, "adversarial": bool}
 REQUIRED = {"subcategory", "adversarial"}
 
 
-def prompt_maps(token, revision):
+def prompt_maps(token):
     """prompt -> value for each transferable field, from WildGuardMix train+test (first non-null wins)."""
     files = ("train/wildguard_train.parquet", "test/wildguard_test.parquet")
     frames = [pd.read_parquet(hf_hub_download("allenai/wildguardmix", filename,
-                                              repo_type="dataset", token=token, revision=revision))
-              for filename in files]
+                                              repo_type="dataset", token=token)) for filename in files]
     wildguard = pd.concat(frames, ignore_index=True)
     values_by_field = {field: {} for field in FIELDS}
     for row in wildguard.itertuples(index=False):
@@ -40,6 +30,22 @@ def prompt_maps(token, revision):
             if pd.notna(value) and row.prompt not in values_by_field[field]:
                 values_by_field[field][row.prompt] = cast(value)
     return values_by_field
+
+
+def validate_source(raw, source):
+    if set(raw) != {"train", "test"}:
+        raise ValueError(f"{source} must contain train/test splits, found {sorted(raw)}")
+    required = {"prompt", "response", "label"}
+    for split_name, split in raw.items():
+        missing = required - set(split.column_names)
+        if missing:
+            raise ValueError(f"{source}/{split_name} is missing columns {sorted(missing)}")
+        labels = {int(label) for label in split["label"]}
+        if not labels <= {0, 1} or labels != {0, 1}:
+            raise ValueError(f"{source}/{split_name} must contain binary labels 0 and 1, found {sorted(labels)}")
+        empty_prompts = sum(not str(prompt).strip() for prompt in split["prompt"])
+        if empty_prompts:
+            raise ValueError(f"{source}/{split_name} contains {empty_prompts} empty prompts")
 
 
 def export_test_split(enriched, output_path):
@@ -59,32 +65,46 @@ def export_test_split(enriched, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", default=str(DEFAULT_RAW),
+    default_dataset_dir = DATA_ROOT / DEFAULT_DATASET
+    parser.add_argument("--source", default=str(default_dataset_dir / "raw"),
                         help="official StreamGuardBench DatasetDict to enrich")
-    parser.add_argument("--dataset-dir", default=str(DEFAULT_DATASET_DIR),
+    parser.add_argument("--dataset-dir", default=str(default_dataset_dir),
                         help="destination containing raw/ and raw_enriched/")
-    parser.add_argument("--taxonomy-revision", default=DEFAULT_TAXONOMY_REVISION,
-                        help="WildGuardMix commit used for the prompt taxonomy")
     args = parser.parse_args()
 
-    source = resolve_project_path(args.source)
-    dataset_dir = resolve_project_path(args.dataset_dir)
+    source = Path(args.source)
+    dataset_dir = Path(args.dataset_dir)
     raw_path = dataset_dir / "raw"
     output_path = dataset_dir / "raw_enriched"
 
+    # Keep a local copy of the source dataset before adding taxonomy fields.
     raw = load_from_disk(str(source))
+    validate_source(raw, source)
     if source.resolve() != raw_path.resolve():
         if raw_path.exists():
-            raise FileExistsError(f"raw dataset already exists: {raw_path}")
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw.save_to_disk(str(raw_path))
+            persisted_raw = load_from_disk(str(raw_path))
+            validate_source(persisted_raw, raw_path)
+            for split_name in raw:
+                if len(raw[split_name]) != len(persisted_raw[split_name]):
+                    raise ValueError(f"existing raw dataset does not match source: {raw_path}/{split_name}")
+                for field in ("prompt", "response", "label"):
+                    if raw[split_name][field] != persisted_raw[split_name][field]:
+                        raise ValueError(
+                            f"existing raw dataset does not match source field {field}: "
+                            f"{raw_path}/{split_name}"
+                        )
+            raw = persisted_raw
+        else:
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw.save_to_disk(str(raw_path))
 
     if output_path.exists():
         raise FileExistsError(f"refusing to overwrite existing enriched dataset: {output_path}")
 
-    token = get_token()
-    values_by_field = prompt_maps(token, args.taxonomy_revision)
+    token = (Path.home() / ".cache/huggingface/token").read_text().strip()
+    values_by_field = prompt_maps(token)
 
+    # Join the WildGuardMix fields by exact prompt text.
     enriched = DatasetDict({split_name: split for split_name, split in raw.items()})
     for split_name in enriched:
         prompts = enriched[split_name]["prompt"]
@@ -102,13 +122,8 @@ def main():
                 )
             enriched[split_name] = enriched[split_name].add_column(field, column)
 
+    # Save the enriched dataset and the JSONL test split consumed downstream.
     enriched.save_to_disk(str(output_path))
-    metadata_path = dataset_dir / "source.json"
-    if metadata_path.exists():
-        metadata = json.loads(metadata_path.read_text())
-        metadata["taxonomy_repository"] = "allenai/wildguardmix"
-        metadata["taxonomy_revision"] = args.taxonomy_revision
-        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     test_path = dataset_dir / "phase2_intervention/test_full.jsonl"
     export_test_split(enriched, test_path)
     print(f"raw source: {raw_path}")

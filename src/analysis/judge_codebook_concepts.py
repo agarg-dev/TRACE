@@ -7,17 +7,17 @@ import json
 import os
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import numpy as np
 import torch
 from google import genai
 from google.genai import types
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
-from activations.activation_cache import load_activation_sequences, read_activation_cache_info
+from activations.cache import load_activation_sequences, read_activation_cache_info
 from data.dataset_splits import train_validation_split
-from project_config import resolve_project_path
 from vq.codebook import assign_codes_for_sequences, split_assignments_by_response
 from vq.model import load_steering_vq_checkpoint
 
@@ -93,12 +93,6 @@ __DESCRIPTIONS__
 
 VALID_STATUSES = {"clear", "mixed", "no_pattern"}
 VALID_SAFETY_LABELS = {"harmful", "benign", "neutral"}
-SAFETY_CATEGORIES = (
-    "HARM_CATEGORY_HARASSMENT",
-    "HARM_CATEGORY_HATE_SPEECH",
-    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-    "HARM_CATEGORY_DANGEROUS_CONTENT",
-)
 RESULT_FILES = ("manifest.json", "examples.jsonl", "requests.jsonl")
 AGREEMENT_FILES = (
     "agreement_manifest.json", "agreement_requests.jsonl", "agreement_judgments.jsonl"
@@ -122,15 +116,25 @@ def parse_args():
     )
     prepare.add_argument("--min-response-support", type=int, default=25)
     prepare.add_argument("--seed", type=int, default=42)
+    prepare.add_argument("--exclude-run", action="append", default=[],
+                         help="prepared run whose sampled responses must not be reused")
     prepare.add_argument("--judge-model", default="gemini-3.1-flash-lite")
     prepare.add_argument("--judge-seed", type=int, default=0)
+    prepare.add_argument("--max-codes", type=int, default=0,
+                         help="prepare only this many eligible codes; 0 prepares all")
     prepare.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+
+    refresh = commands.add_parser(
+        "refresh-prompt", help="reuse prepared examples with the current prompt"
+    )
+    refresh.add_argument("--source", required=True)
+    refresh.add_argument("--output", required=True)
 
     judge = commands.add_parser("judge", help="send prepared requests to Gemini")
     judge.add_argument("--output", required=True)
     judge.add_argument("--judge-model", required=True)
-    judge.add_argument("--workers", type=int, default=8)
     judge.add_argument("--max-retries", type=int, default=MAX_RETRIES)
+    judge.add_argument("--workers", type=int, default=8)
 
     prepare_agreement = commands.add_parser(
         "prepare-agreement", help="prepare semantic agreement requests from three judged runs"
@@ -145,8 +149,8 @@ def parse_args():
     )
     judge_agreement.add_argument("--output", required=True)
     judge_agreement.add_argument("--judge-model", required=True)
-    judge_agreement.add_argument("--workers", type=int, default=8)
     judge_agreement.add_argument("--max-retries", type=int, default=MAX_RETRIES)
+    judge_agreement.add_argument("--workers", type=int, default=8)
     return parser.parse_args()
 
 
@@ -167,7 +171,21 @@ def read_jsonl(path):
         return [json.loads(line) for line in input_file if line.strip()]
 
 
-def resolve_device(name):
+def load_excluded_response_ids(run_paths, num_codes):
+    excluded = [set() for _ in range(num_codes)]
+    resolved_runs = []
+    for run_path in run_paths:
+        run = Path(run_path)
+        rows = read_jsonl(run / "examples.jsonl")
+        for row in rows:
+            code = int(row["code_id"])
+            response_ids = {int(example["response_id"]) for example in row["examples"]}
+            excluded[code].update(response_ids)
+        resolved_runs.append(str(run))
+    return excluded, resolved_runs
+
+
+def select_device(name):
     if name == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     if name == "cuda" and not torch.cuda.is_available():
@@ -178,23 +196,21 @@ def resolve_device(name):
 def training_partition(sequences, config):
     """Recreate the exact VQ training partition recorded in the checkpoint."""
     seed = int(config["seed"])
-    scheme = config.get("split_scheme")
-    if scheme != "nested_90_5_5":
-        raise ValueError(f"unsupported or missing VQ split scheme: {scheme!r}")
     detector_training, _ = train_validation_split(sequences, seed)
     training, holdout = train_validation_split(detector_training, seed)
     validation, test = train_validation_split(holdout, seed, validation_fraction=0.5)
 
-    expected = config.get("split_partition_counts")
     actual = {"vq_train": len(training), "vq_validation": len(validation), "vq_test": len(test)}
-    if expected != actual:
-        raise ValueError(f"checkpoint split counts do not match reconstructed split: {expected} != {actual}")
     return training, actual
 
 
 def maximal_runs(codes):
     """Yield (code, start, end) for maximal constant runs; end is exclusive."""
     codes = np.asarray(codes, dtype=np.int64)
+    if codes.ndim != 1:
+        raise ValueError("code assignments must be one-dimensional")
+    if len(codes) == 0:
+        return
     start = 0
     for end in range(1, len(codes) + 1):
         if end == len(codes) or codes[end] != codes[start]:
@@ -202,14 +218,18 @@ def maximal_runs(codes):
             start = end
 
 
-def sample_runs(sequences, code_sequences, num_codes, examples_per_code, seed):
+def sample_runs(sequences, code_sequences, num_codes, examples_per_code, seed,
+                excluded_response_ids=None):
     """Uniformly sample responses per code while retaining only one run from each response."""
     response_support = np.zeros(num_codes, dtype=np.int64)
+    available_response_support = np.zeros(num_codes, dtype=np.int64)
     token_counts = np.zeros(num_codes, dtype=np.int64)
     run_counts = np.zeros(num_codes, dtype=np.int64)
     samples = [[] for _ in range(num_codes)]
     random_states = [np.random.default_rng(np.random.SeedSequence([seed, code]))
                      for code in range(num_codes)]
+    if excluded_response_ids is None:
+        excluded_response_ids = [set() for _ in range(num_codes)]
     for sequence_index, (sequence, codes) in enumerate(zip(sequences, code_sequences)):
         codes = np.asarray(codes, dtype=np.int64)
         token_counts += np.bincount(codes, minlength=num_codes)
@@ -221,8 +241,11 @@ def sample_runs(sequences, code_sequences, num_codes, examples_per_code, seed):
 
         for code, runs in runs_by_code.items():
             response_support[code] += 1
+            if int(sequence["idx"]) in excluded_response_ids[code]:
+                continue
             random_state = random_states[code]
             start, end = runs[int(random_state.integers(len(runs)))]
+            available_response_support[code] += 1
             candidate = {
                 "sequence_index": sequence_index,
                 "response_id": int(sequence["idx"]),
@@ -234,7 +257,7 @@ def sample_runs(sequences, code_sequences, num_codes, examples_per_code, seed):
             if len(reservoir) < examples_per_code:
                 reservoir.append(candidate)
                 continue
-            replacement = int(random_state.integers(response_support[code]))
+            replacement = int(random_state.integers(available_response_support[code]))
             if replacement < examples_per_code:
                 reservoir[replacement] = candidate
 
@@ -242,7 +265,7 @@ def sample_runs(sequences, code_sequences, num_codes, examples_per_code, seed):
         if reservoir:
             order = random_states[code].permutation(len(reservoir))
             samples[code] = [reservoir[int(index)] for index in order]
-    return samples, response_support, token_counts, run_counts
+    return samples, response_support, available_response_support, token_counts, run_counts
 
 
 def decode_tokens(tokenizer, token_ids):
@@ -296,6 +319,56 @@ def render_examples(examples):
     return "\n".join(rendered)
 
 
+def build_user_prompt(examples):
+    return TASK_PROMPT.replace("__EXAMPLES__", render_examples(examples))
+
+
+def refresh_prompt(args):
+    source = Path(args.source)
+    output = Path(args.output)
+    manifest_path = source / "manifest.json"
+    examples_path = source / "examples.jsonl"
+    if not manifest_path.is_file() or not examples_path.is_file():
+        raise FileNotFoundError(f"source run is not prepared: {source}")
+
+    output.mkdir(parents=True, exist_ok=True)
+    existing = [name for name in RESULT_FILES if (output / name).exists()]
+    if existing:
+        raise FileExistsError(f"refusing to replace prepared files in {output}: {', '.join(existing)}")
+
+    manifest = json.loads(manifest_path.read_text())
+    examples = read_jsonl(examples_path)
+    requests = []
+    for row in examples:
+        if not row["selected_for_judging"]:
+            continue
+        requests.append({
+            "code_id": int(row["code_id"]),
+            "example_count": len(row["examples"]),
+            "system_prompt": SYSTEM_PROMPT,
+            "user_prompt": build_user_prompt(row["examples"]),
+        })
+    refreshed_manifest = dict(manifest)
+    refreshed_manifest.update({
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source_prepared_run": str(source),
+    })
+    write_jsonl(output / "examples.jsonl", examples)
+    write_jsonl(output / "requests.jsonl", requests)
+    write_json(output / "manifest.json", refreshed_manifest)
+    print(f"Prepared {len(requests)} requests from saved examples in {output}", flush=True)
+
+
+def keyed_concepts(rows, run):
+    concepts = {}
+    for row in rows:
+        code = int(row["code_id"])
+        if code in concepts:
+            raise ValueError(f"duplicate concept row for code {code}: {run}")
+        concepts[code] = row
+    return concepts
+
+
 def render_descriptions(descriptions):
     rendered = []
     for description in descriptions:
@@ -308,9 +381,20 @@ def render_descriptions(descriptions):
     return "\n".join(rendered)
 
 
+def build_agreement_prompt(descriptions):
+    return AGREEMENT_TASK_PROMPT.replace("__DESCRIPTIONS__", render_descriptions(descriptions))
+
+
 def prepare_agreement(args):
-    runs = [resolve_project_path(path).resolve() for path in args.runs]
-    output = resolve_project_path(args.output).resolve()
+    if args.judge_seed < 0:
+        raise ValueError("judge seed cannot be negative")
+
+    runs = [Path(path) for path in args.runs]
+    missing = [run for run in runs if not (run / "analysis.json").is_file()]
+    if missing:
+        raise FileNotFoundError(f"judged analysis does not exist: {missing[0]}")
+
+    output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     existing = [name for name in AGREEMENT_FILES if (output / name).exists()]
     if existing:
@@ -318,19 +402,14 @@ def prepare_agreement(args):
 
     manifests = [json.loads((run / "manifest.json").read_text()) for run in runs]
     analyses = [json.loads((run / "analysis.json").read_text()) for run in runs]
-    identity_fields = ("dataset", "judge_model", "examples_per_code")
-    identities = {tuple(manifest[field] for field in identity_fields) for manifest in manifests}
-    if len(identities) != 1:
-        raise ValueError("agreement runs must use the same dataset, judge, and example count")
     seeds = [int(manifest["seed"]) for manifest in manifests]
     if len(set(seeds)) != len(seeds):
         raise ValueError("agreement runs must use distinct sampling seeds")
-    concepts = [
-        {int(row["code_id"]): row for row in analysis["concepts"]}
-        for analysis in analyses
-    ]
+    concepts = [keyed_concepts(analysis["concepts"], run)
+                for analysis, run in zip(analyses, runs)]
     common_codes = set.intersection(*(set(rows) for rows in concepts))
 
+    # Compare descriptions only when at least two runs found a clear pattern.
     requests = []
     for code in sorted(common_codes):
         descriptions = []
@@ -348,12 +427,11 @@ def prepare_agreement(args):
             "code_id": code,
             "valid_run_ids": [description["run_id"] for description in descriptions],
             "system_prompt": AGREEMENT_SYSTEM_PROMPT,
-            "user_prompt": AGREEMENT_TASK_PROMPT.replace(
-                "__DESCRIPTIONS__", render_descriptions(descriptions)
-            ),
+            "user_prompt": build_agreement_prompt(descriptions),
         })
 
     manifest = {
+        "format_version": 1,
         "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "runs": [str(run) for run in runs],
         "sampling_seeds": seeds,
@@ -366,57 +444,34 @@ def prepare_agreement(args):
     print(f"Prepared {len(requests)} semantic-agreement requests in {output}", flush=True)
 
 
-def checkpoint_regions(model):
-    regions = model.checkpoint_regions or {}
-    harmful = {int(code) for code in regions.get("harmful_codes", [])}
-    benign = {int(code) for code in regions.get("benign_codes", [])}
-    scores = regions.get("signed_harmfulness")
-    return harmful, benign, scores
-
-
-def validate_qwen_inputs(activation_cache, model_path, model, config):
-    model_config = AutoConfig.from_pretrained(
-        str(model_path), trust_remote_code=True, local_files_only=True
-    )
-    if model_config.model_type != "qwen3":
-        raise ValueError(f"this analysis currently supports Qwen3, not {model_config.model_type!r}")
-
-    cache_info = read_activation_cache_info(activation_cache)
-    if cache_info["dataset"] != config["dataset"]:
-        raise ValueError("activation cache and checkpoint refer to different datasets")
-
-    read_layer = int(config["read_layer"])
-    code_dimension = int(model.quantizer.codebook.shape[1])
-    dimensions = {int(cache_info["hidden"]), int(model_config.hidden_size), code_dimension}
-    if len(dimensions) != 1:
-        raise ValueError("generator, activation cache, and VQ checkpoint dimensions do not match")
-    return cache_info, read_layer
-
-
 def prepare(args):
-    checkpoint = resolve_project_path(args.checkpoint).resolve()
-    activation_cache = resolve_project_path(args.activation_cache).resolve()
-    model_path = resolve_project_path(args.model_path).resolve()
-    output = resolve_project_path(args.output).resolve()
+    checkpoint = Path(args.checkpoint)
+    activation_cache = Path(args.activation_cache)
+    model_path = Path(args.model_path)
+    output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     existing = [name for name in RESULT_FILES if (output / name).exists()]
     if existing:
         raise FileExistsError(f"refusing to replace prepared files in {output}: {', '.join(existing)}")
 
-    device = resolve_device(args.device)
+    device = select_device(args.device)
     model, num_codes = load_steering_vq_checkpoint(checkpoint, device)
     config = model.checkpoint_config
-    cache_info, read_layer = validate_qwen_inputs(activation_cache, model_path, model, config)
+    cache_info = read_activation_cache_info(activation_cache)
+    read_layer = int(config["read_layer"])
+    excluded_response_ids, excluded_runs = load_excluded_response_ids(args.exclude_run, num_codes)
     sequences = load_activation_sequences(activation_cache, read_layer)
     training, split_counts = training_partition(sequences, config)
 
+    # Assign the VQ training tokens and sample independent response contexts per concept.
     print(f"Assigning {sum(len(sequence['x']) for sequence in training):,} training tokens", flush=True)
     assignments = assign_codes_for_sequences(
         model, training, device, assignment_space="encoded_activation"
     )
     code_sequences = split_assignments_by_response(training, assignments)
-    samples, response_support, token_counts, run_counts = sample_runs(
+    samples, response_support, available_response_support, token_counts, run_counts = sample_runs(
         training, code_sequences, num_codes, args.examples_per_code, args.seed,
+        excluded_response_ids,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -425,11 +480,16 @@ def prepare(args):
     required_support = max(args.examples_per_code, args.min_response_support)
     eligible_codes = [
         code for code in range(num_codes)
-        if response_support[code] >= required_support
+        if available_response_support[code] >= required_support
     ]
-    selected_set = set(eligible_codes)
-    harmful_codes, benign_codes, harmfulness_scores = checkpoint_regions(model)
+    selected_codes = eligible_codes[:args.max_codes] if args.max_codes else eligible_codes
+    selected_set = set(selected_codes)
+    regions = model.checkpoint_regions
+    harmful_codes = {int(code) for code in regions["harmful_codes"]}
+    benign_codes = {int(code) for code in regions["benign_codes"]}
+    harmfulness_scores = regions["signed_harmfulness"]
 
+    # Decode the sampled contexts and prepare one Gemini request per eligible concept.
     example_rows, request_rows = [], []
     for code in range(num_codes):
         selected = code in selected_set
@@ -441,15 +501,17 @@ def prepare(args):
                     tokenizer, training[sequence_index], candidate, args.context_window,
                     example_id,
                 ))
-
         region = "harmful" if code in harmful_codes else "benign" if code in benign_codes else "unassigned"
         row = {
             "code_id": code,
             "selected_for_judging": selected,
             "selection_status": (
-                "selected" if selected else "insufficient_support"
+                "selected" if selected else
+                "insufficient_support" if available_response_support[code] < required_support else
+                "max_codes_limit"
             ),
             "response_support": int(response_support[code]),
+            "available_response_support": int(available_response_support[code]),
             "token_count": int(token_counts[code]),
             "run_count": int(run_counts[code]),
             "region": region,
@@ -464,10 +526,11 @@ def prepare(args):
                 "code_id": code,
                 "example_count": len(examples),
                 "system_prompt": SYSTEM_PROMPT,
-                "user_prompt": TASK_PROMPT.replace("__EXAMPLES__", render_examples(examples)),
+                "user_prompt": build_user_prompt(examples),
             })
 
     manifest = {
+        "format_version": 2,
         "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "checkpoint": str(checkpoint),
         "activation_cache": str(activation_cache),
@@ -487,10 +550,14 @@ def prepare(args):
         "effective_min_response_support": required_support,
         "seed": args.seed,
         "judge_seed": args.judge_seed,
+        "excluded_runs": excluded_runs,
         "judge_model": args.judge_model,
         "eligible_code_count": len(eligible_codes),
-        "selected_code_count": len(eligible_codes),
+        "selected_code_count": len(selected_codes),
+        "partial_run": bool(args.max_codes and len(selected_codes) < len(eligible_codes)),
     }
+
+    # Preparation is separate from judging so the exact sampled contexts are retained.
     write_jsonl(output / "examples.jsonl", example_rows)
     write_jsonl(output / "requests.jsonl", request_rows)
     write_json(output / "manifest.json", manifest)
@@ -501,10 +568,23 @@ def prepare(args):
 
 
 def parse_judgment(raw_text):
-    value = json.loads(raw_text)
+    try:
+        value = json.loads(raw_text)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("response is not valid JSON") from error
+    required = {"status", "name", "description", "safety_label"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("response does not contain exactly the required fields")
+    if value["status"] not in VALID_STATUSES:
+        raise ValueError("invalid concept status")
+
     if value["status"] == "clear":
-        if not value["name"] or not value["description"] or not value["safety_label"]:
-            raise ValueError("a clear concept requires a name, description, and safety label")
+        if not isinstance(value["name"], str) or not value["name"].strip():
+            raise ValueError("a clear concept requires a name")
+        if not isinstance(value["description"], str) or not value["description"].strip():
+            raise ValueError("a clear concept requires a description")
+        if value["safety_label"] not in VALID_SAFETY_LABELS:
+            raise ValueError("a clear concept requires a valid safety label")
         value["name"] = value["name"].strip()
         value["description"] = value["description"].strip()
     elif (value["name"] is not None or value["description"] is not None or
@@ -515,15 +595,30 @@ def parse_judgment(raw_text):
 
 
 def parse_agreement_judgment(raw_text, valid_run_ids):
-    value = json.loads(raw_text)
+    try:
+        value = json.loads(raw_text)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("response is not valid JSON") from error
+    required = {"agreement", "name", "description", "agreeing_run_ids"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("response does not contain exactly the required agreement fields")
+    if not isinstance(value["agreement"], bool):
+        raise ValueError("agreement must be a boolean")
+
     ids = value["agreeing_run_ids"]
     allowed = set(valid_run_ids)
+    if not isinstance(ids, list) or any(isinstance(item, bool) or not isinstance(item, int) for item in ids):
+        raise ValueError("agreeing_run_ids must be a list of integers")
     if len(ids) != len(set(ids)) or not set(ids).issubset(allowed):
         raise ValueError("agreeing run IDs must be unique and refer to supplied descriptions")
 
     if value["agreement"]:
-        if len(ids) < 2 or not value["name"] or not value["description"]:
-            raise ValueError("semantic agreement requires two runs, a name, and a description")
+        if len(ids) < 2:
+            raise ValueError("semantic agreement requires at least two agreeing runs")
+        if not isinstance(value["name"], str) or not value["name"].strip():
+            raise ValueError("semantic agreement requires a concept name")
+        if not isinstance(value["description"], str) or not value["description"].strip():
+            raise ValueError("semantic agreement requires a concept description")
         value["name"] = value["name"].strip()
         value["description"] = value["description"].strip()
     elif value["name"] is not None or value["description"] is not None or ids:
@@ -546,6 +641,12 @@ def gemini_config(seed, system_prompt):
         },
         required=["status", "name", "description", "safety_label"],
     )
+    safety_categories = (
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    )
     return types.GenerateContentConfig(
         system_instruction=system_prompt,
         temperature=0.0,
@@ -554,7 +655,7 @@ def gemini_config(seed, system_prompt):
         response_schema=schema,
         safety_settings=[
             types.SafetySetting(category=category, threshold="BLOCK_NONE")
-            for category in SAFETY_CATEGORIES
+            for category in safety_categories
         ],
     )
 
@@ -572,6 +673,12 @@ def agreement_gemini_config(seed, system_prompt):
         },
         required=["agreement", "name", "description", "agreeing_run_ids"],
     )
+    safety_categories = (
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    )
     return types.GenerateContentConfig(
         system_instruction=system_prompt,
         temperature=0.0,
@@ -580,14 +687,13 @@ def agreement_gemini_config(seed, system_prompt):
         response_schema=schema,
         safety_settings=[
             types.SafetySetting(category=category, threshold="BLOCK_NONE")
-            for category in SAFETY_CATEGORIES
+            for category in safety_categories
         ],
     )
 
 
 def request_with_retries(client, model, request, seed, max_retries, config_builder, parser):
-    raw_text = None
-    last_error = None
+    attempts = []
     for attempt in range(max_retries):
         try:
             reply = client.models.generate_content(
@@ -608,17 +714,17 @@ def request_with_retries(client, model, request, seed, max_retries, config_build
                 "error": None,
             }
         except Exception as error:
-            last_error = f"{type(error).__name__}: {error}"
+            attempts.append(f"{type(error).__name__}: {error}")
             if attempt + 1 < max_retries:
                 time.sleep(2 ** attempt)
     return {
         "code_id": int(request["code_id"]),
         "state": "error",
         "judgment": None,
-        "raw_response": raw_text,
+        "raw_response": raw_text if "raw_text" in locals() else None,
         "usage": None,
         "attempts": max_retries,
-        "error": last_error[:500],
+        "error": attempts[-1][:500] if attempts else "unknown Gemini error",
     }
 
 
@@ -636,9 +742,11 @@ def judge_agreement_request(client, model, request, seed, max_retries):
     )
 
 
-def run_judgments(client, model, requests, judgment_path, judge_seed, workers, max_retries,
-                  request_function):
-    judgments = {int(row["code_id"]): row for row in read_jsonl(judgment_path)}
+def run_judgments(
+    client, model, requests, judgment_path, judge_seed, max_retries, workers, request_function
+):
+    previous = read_jsonl(judgment_path)
+    judgments = {int(row["code_id"]): row for row in previous}
 
     pending = [
         request for request in requests
@@ -653,18 +761,26 @@ def run_judgments(client, model, requests, judgment_path, judge_seed, workers, m
             write_jsonl(judgment_path, [])
         return
 
-    def judge_one(request):
-        return request_function(client, model, request, judge_seed, max_retries)
-
+    # Hosted requests are independent, so run a small worker pool and checkpoint progress.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for result in pool.map(judge_one, pending):
-            judgments[int(result["code_id"])] = result
+        futures = {}
+        for request in pending:
+            future = pool.submit(
+                request_function, client, model, request, judge_seed, max_retries
+            )
+            futures[future] = int(request["code_id"])
+        for completed, future in enumerate(as_completed(futures), start=1):
+            code = futures[future]
+            judgments[code] = future.result()
+            if completed % 10 == 0:
+                write_jsonl(judgment_path, [judgments[code] for code in sorted(judgments)])
+                print(f"  saved {len(judgments)}/{len(requests)} judgments", flush=True)
 
     write_jsonl(judgment_path, [judgments[code] for code in sorted(judgments)])
     print(f"Saved {len(judgments)} judgments to {judgment_path}", flush=True)
 
 
-def require_judge_inputs():
+def require_judge_inputs(args):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("set GEMINI_API_KEY before running the judge")
@@ -672,35 +788,25 @@ def require_judge_inputs():
 
 
 def judge(args):
-    client = require_judge_inputs()
-    output = resolve_project_path(args.output).resolve()
+    client = require_judge_inputs(args)
+    output = Path(args.output)
     manifest = json.loads((output / "manifest.json").read_text())
-    if args.judge_model != manifest["judge_model"]:
-        raise ValueError(
-            f"judge model differs from prepared run: {args.judge_model!r} != {manifest['judge_model']!r}"
-        )
     requests = read_jsonl(output / "requests.jsonl")
     run_judgments(
         client, args.judge_model, requests, output / "judgments.jsonl",
-        int(manifest.get("judge_seed", manifest["seed"])), args.workers,
-        args.max_retries, judge_request,
+        int(manifest.get("judge_seed", manifest["seed"])), args.max_retries,
+        args.workers, judge_request,
     )
 
 
 def judge_agreement(args):
-    client = require_judge_inputs()
-    output = resolve_project_path(args.output).resolve()
+    client = require_judge_inputs(args)
+    output = Path(args.output)
     manifest = json.loads((output / "agreement_manifest.json").read_text())
-    if args.judge_model != manifest["judge_model"]:
-        raise ValueError(
-            f"judge model differs from prepared agreement run: "
-            f"{args.judge_model!r} != {manifest['judge_model']!r}"
-        )
     requests = read_jsonl(output / "agreement_requests.jsonl")
     run_judgments(
         client, args.judge_model, requests, output / "agreement_judgments.jsonl",
-        int(manifest["judge_seed"]), args.workers, args.max_retries,
-        judge_agreement_request,
+        int(manifest["judge_seed"]), args.max_retries, args.workers, judge_agreement_request,
     )
 
 
@@ -708,6 +814,8 @@ def main():
     args = parse_args()
     if args.command == "prepare":
         prepare(args)
+    elif args.command == "refresh-prompt":
+        refresh_prompt(args)
     elif args.command == "judge":
         judge(args)
     elif args.command == "prepare-agreement":

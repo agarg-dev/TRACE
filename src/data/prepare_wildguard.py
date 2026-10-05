@@ -8,7 +8,7 @@ from pathlib import Path
 from datasets import load_from_disk
 from huggingface_hub import snapshot_download
 
-from project_config import DATA_ROOT, resolve_project_path
+from project_config import DATA_ROOT
 
 
 SOURCE_REPOSITORY = "Alibaba-AAIG/StreamGuardBench"
@@ -31,7 +31,7 @@ def main():
     if args.source_root:
         if not args.source_revision:
             parser.error("--source-root requires --source-revision")
-        source_path = resolve_project_path(args.source_root) / subdirectory
+        source_path = Path(args.source_root).expanduser() / subdirectory
         resolved_revision = args.source_revision
     else:
         snapshot_path = Path(snapshot_download(

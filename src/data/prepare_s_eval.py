@@ -1,11 +1,5 @@
 #!/usr/bin/env python
-"""Download and prepare official model-specific S-Eval responses.
-
-The Hugging Face source is a saved DatasetDict. This script exports plain JSONL
-files with stable row identifiers so the activation-caching pipeline can use
-the data without depending on the Hub at compute time.
-
-"""
+"""Download model-specific S-Eval responses and export them as JSONL."""
 
 import argparse
 import json
@@ -15,25 +9,52 @@ from pathlib import Path
 from datasets import load_from_disk
 from huggingface_hub import snapshot_download
 
-from data.dataset_splits import S_EVAL_DATASET
-from project_config import DATA_ROOT, resolve_project_path
+from data.dataset_splits import (
+    S_EVAL_DATASET,
+    S_EVAL_INTERNLM_DATASET,
+    S_EVAL_LLAMA_DATASET,
+)
+from project_config import DATA_ROOT
 
 
 SOURCE_REPOSITORY = "Alibaba-AAIG/StreamGuardBench"
+REQUIRED_COLUMNS = {"prompt", "response", "label"}
 MODEL_CONFIGS = {
     "qwen3_8b": {
         "dataset": S_EVAL_DATASET,
         "display_name": "Qwen3-8B",
     },
     "llama_3_1_8b_instruct": {
-        "dataset": "s_eval_llama_3_1_8b_instruct",
+        "dataset": S_EVAL_LLAMA_DATASET,
         "display_name": "Llama-3.1-8B-Instruct",
     },
     "internlm3_8_instruct": {
-        "dataset": "s_eval_internlm3_8b_instruct",
+        "dataset": S_EVAL_INTERNLM_DATASET,
         "display_name": "InternLM3-8B-Instruct",
     },
 }
+
+
+def validate_split(dataset, split_name):
+    missing_columns = REQUIRED_COLUMNS - set(dataset.column_names)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"{split_name} is missing required columns: {missing}")
+
+    labels = Counter(int(label) for label in dataset["label"])
+    unexpected_labels = set(labels) - {0, 1}
+    if unexpected_labels:
+        raise ValueError(f"{split_name} contains unexpected labels: {sorted(unexpected_labels)}")
+    if labels[0] == 0 or labels[1] == 0:
+        raise ValueError(f"{split_name} must contain both safe and harmful responses")
+
+    empty_prompts = sum(not prompt.strip() for prompt in dataset["prompt"])
+    empty_responses = sum(not response.strip() for response in dataset["response"])
+    if empty_prompts or empty_responses:
+        raise ValueError(
+            f"{split_name} contains {empty_prompts} empty prompts and {empty_responses} empty responses"
+        )
+    return labels
 
 
 def export_jsonl(dataset, output_path, id_key):
@@ -90,10 +111,11 @@ def main():
     model_name = model_config["display_name"]
     source_subdirectory = f"s_eval/{args.model}"
 
+    # Use an existing snapshot when supplied, otherwise download the requested revision.
     if args.source_root:
         if not args.source_revision:
-            parser.error("--source-root requires --source-revision")
-        source_root = resolve_project_path(args.source_root)
+            raise ValueError("--source-root requires --source-revision for reproducible provenance")
+        source_root = Path(args.source_root)
         source_path = source_root / source_subdirectory
         resolved_revision = args.source_revision
     else:
@@ -106,16 +128,19 @@ def main():
         source_path = snapshot_path / source_subdirectory
         resolved_revision = snapshot_path.name
 
+    # Validate and export the official train and test splits.
     source_dataset = load_from_disk(str(source_path))
-    counts = {
-        split_name: Counter(int(label) for label in source_dataset[split_name]["label"])
-        for split_name in ("train", "test")
-    }
+    if set(source_dataset) != {"train", "test"}:
+        raise ValueError(f"expected train/test splits, found {sorted(source_dataset)}")
+
+    counts = {split_name: validate_split(source_dataset[split_name], split_name)
+              for split_name in ("train", "test")}
     dataset_dir = DATA_ROOT / dataset_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
     export_jsonl(source_dataset["train"], dataset_dir / "train.jsonl", "idx")
     export_jsonl(source_dataset["test"], dataset_dir / "test.jsonl", "test_index")
 
+    # Record the exact source snapshot alongside the exported rows.
     source_metadata = {
         "repository": SOURCE_REPOSITORY,
         "subset": source_subdirectory,

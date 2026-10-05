@@ -9,6 +9,10 @@ checkpoint=output/runs/vq/qwen_wildguard/model_joint.pt
 output_dir=output/runs/steering/qwen_wildguard_validation
 method=additive_renorm_gate
 strengths="0.25 0.5 0.75 1.0"
+concept=code_mean
+counterpart_selection=fixed
+min_benign_response_support=10
+code_score_prior_strength=10
 max_new_tokens=2048
 batch_size=8
 
@@ -22,5 +26,9 @@ python src/steering/run_steering.py \
     --checkpoint $checkpoint \
     --methods $method \
     --lambdas $strengths \
+    --concept $concept \
+    --counterpart-selection $counterpart_selection \
+    --min-benign-response-support $min_benign_response_support \
+    --code-score-prior-strength $code_score_prior_strength \
     --max-new-tokens $max_new_tokens \
     --batch-size $batch_size

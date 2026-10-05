@@ -1,21 +1,19 @@
 #!/usr/bin/env python
-"""Tune the causal detector on validation data and save the selected checkpoint."""
+"""Tune the causal sequence detector on validation data."""
 
 import argparse
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import optuna
 import torch
 
-from activations.activation_cache import (
-    load_activation_sequences,
-    resolve_activation_cache,
-)
-from data.dataset_splits import DETECTOR_TRAIN_SET_BY_DATASET, train_validation_split, training_split
-from project_config import DEFAULT_DATASET, DETECTION_RUNS_DIR, READ_LAYER, resolve_project_path
+from activations.cache import load_activation_sequences
+from data.dataset_splits import DEFAULT_DATASET, train_validation_split, training_split
+from project_config import DETECTION_RUNS_DIR, READ_LAYER
 from vq.model import load_vq_checkpoint
 
 from detection.sequence_classifier import (
@@ -55,9 +53,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-representation", choices=["vq", "raw", "hybrid"], default="vq")
     parser.add_argument("--vq-run", required=True)
-    parser.add_argument("--vq-checkpoint", default="model_joint.pt")
+    parser.add_argument("--vq-checkpoint", default="model_task.pt")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--train-set", default=None)
+    parser.add_argument("--train-set", default="train")
     parser.add_argument("--activation-cache", default=None)
     parser.add_argument("--activation-layer", type=int, default=None)
     parser.add_argument("--raw-projection-dim", type=int, default=256,
@@ -84,6 +82,7 @@ def parse_args():
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--run-path-file", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -104,7 +103,9 @@ def suggest_hyperparameters(trial, input_representation, raw_projection_dim=256,
         parameters["projection_dim"] = trial.suggest_categorical("projection_dim", WIDTHS)
     if input_representation in {"vq", "hybrid"}:
         parameters.update({
-            "harmfulness_score_weight": trial.suggest_float("harmfulness_score_weight", 0.0, 2.0, step=0.25),
+            "harmfulness_score_weight": trial.suggest_float(
+                "harmfulness_score_weight", 0.0, 2.0, step=0.25
+            ),
         })
     else:
         parameters.update({"harmfulness_score_weight": 0.0})
@@ -113,22 +114,25 @@ def suggest_hyperparameters(trial, input_representation, raw_projection_dim=256,
 
 def make_model(prepared, parameters, device):
     if prepared.input_representation == "vq":
-        return CodeSequenceClassifier(
+        model = CodeSequenceClassifier(
             prepared.codebook, prepared.code_features, parameters["projection_dim"], parameters["hidden_dim"],
             1, parameters["dropout"], prepared.hazard_bias, parameters["harmfulness_score_weight"],
         ).to(device)
+        return model, prepared.code_features, prepared.code_statistics
 
     if prepared.input_representation == "hybrid":
-        return HybridSequenceClassifier(
+        model = HybridSequenceClassifier(
             prepared.activation_dim, prepared.codebook, prepared.code_features,
             parameters["raw_projection_dim"], parameters["vq_projection_dim"], parameters["hidden_dim"],
             1, parameters["dropout"], prepared.hazard_bias, parameters["harmfulness_score_weight"],
         ).to(device)
+        return model, prepared.code_features, prepared.code_statistics
 
-    return RawActivationSequenceClassifier(
+    model = RawActivationSequenceClassifier(
         prepared.activation_dim, parameters["projection_dim"], parameters["hidden_dim"],
         1, parameters["dropout"], prepared.hazard_bias,
     ).to(device)
+    return model, None, None
 
 
 def train_configuration(prepared, parameters, args, device):
@@ -138,12 +142,18 @@ def train_configuration(prepared, parameters, args, device):
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    model = make_model(prepared, parameters, device)
+    model, code_features, code_statistics = make_model(prepared, parameters, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=parameters["lr"], weight_decay=parameters["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=args.lr_reduction_factor,
         patience=args.lr_patience, min_lr=args.min_lr,
     )
+    loss_args = SimpleNamespace(
+        batch_size=args.batch_size,
+        response_weight=args.response_weight,
+        streaming_weight=parameters["streaming_weight"],
+    )
+
     history, best_state = [], None
     best_score = best_response_ap = best_streaming_ap = -1.0
     best_response_f1 = best_streaming_f1 = -1.0
@@ -170,8 +180,7 @@ def train_configuration(prepared, parameters, args, device):
             batch_count += 1
 
         validation_losses = evaluate_loss(
-            model, prepared.validation, args.batch_size, args.response_weight,
-            parameters["streaming_weight"], prepared.class_weights, device, prepared.pad_batch,
+            model, prepared.validation, loss_args, prepared.class_weights, device, prepared.pad_batch
         )
         scored = prepared.score_sequences(model, prepared.validation, args.batch_size, device)
         response_summary = summarize_scores(scored["labels"], scored["response_scores"], {"argmax": 0.5})
@@ -211,14 +220,12 @@ def train_configuration(prepared, parameters, args, device):
             if args.patience and epochs_without_improvement >= args.patience:
                 break
 
+    if best_state is None:
+        raise RuntimeError("training did not produce a classifier checkpoint")
     model.load_state_dict(best_state, strict=True)
     validation_scores = prepared.score_sequences(model, prepared.validation, args.batch_size, device)
-    response_summary = summarize_scores(
-        validation_scores["labels"], validation_scores["response_scores"], {"argmax": 0.5}
-    )
-    streaming_summary = summarize_scores(
-        validation_scores["labels"], validation_scores["streaming_scores"], {"argmax": 0.5}
-    )
+    response_summary = summarize_scores(validation_scores["labels"], validation_scores["response_scores"], {"argmax": 0.5})
+    streaming_summary = summarize_scores(validation_scores["labels"], validation_scores["streaming_scores"], {"argmax": 0.5})
     return {
         "model": model,
         "best_state": best_state,
@@ -231,15 +238,15 @@ def train_configuration(prepared, parameters, args, device):
         "validation_response_f1_at_0.5": response_summary["operating_points"]["argmax"]["f1"],
         "validation_streaming_f1_at_0.5": streaming_summary["operating_points"]["argmax"]["f1"],
         "validation_scores": validation_scores,
-        "code_features": prepared.code_features,
-        "code_statistics": prepared.code_statistics,
+        "code_features": code_features,
+        "code_statistics": code_statistics,
         "history": history,
     }
 
 
 def prepare_data(args, device):
-    args.train_set = args.train_set or DETECTOR_TRAIN_SET_BY_DATASET[args.dataset]
-    training_data = training_split(args.train_set, args.dataset)
+    # Load the VQ checkpoint and choose the activation layer used by the detector.
+    training_data = training_split(args.train_set or "train", args.dataset)
     args.train_set = training_data.name
     vq_run = vq_checkpoint_path = codebook = checkpoint_regions = None
     vq_config = {}
@@ -248,23 +255,15 @@ def prepare_data(args, device):
     if args.code_vector_source != "codebook" and not uses_vq:
         raise ValueError("activation-mean code vectors require VQ or hybrid input")
     if uses_vq:
-        vq_run = resolve_project_path(args.vq_run)
+        vq_run = Path(args.vq_run)
         vq_checkpoint_path = vq_run / args.vq_checkpoint
         vq_model, vq_checkpoint = load_vq_checkpoint(vq_checkpoint_path, device)
         vq_config = vq_checkpoint["config"]
         checkpoint_layer = int(vq_config.get("read_layer", READ_LAYER))
-        if args.activation_layer is not None and args.activation_layer != checkpoint_layer:
-            raise ValueError(
-                f"--activation-layer {args.activation_layer} does not match checkpoint layer {checkpoint_layer}"
-            )
         args.activation_layer = checkpoint_layer
         split_seed = int(vq_config.get("seed", 42) if args.seed is None else args.seed)
         checkpoint_regions = vq_checkpoint.get("regions")
-        if (
-            args.activation_cache is None
-            and vq_config.get("dataset") == args.dataset
-            and vq_config.get("train_set") == args.train_set
-        ):
+        if args.activation_cache is None:
             args.activation_cache = vq_config.get("training_cache")
         del vq_checkpoint
     else:
@@ -272,21 +271,18 @@ def prepare_data(args, device):
         args.activation_layer = READ_LAYER if args.activation_layer is None else args.activation_layer
         split_seed = int(42 if args.seed is None else args.seed)
 
-    activation_cache = resolve_activation_cache(
-        args.dataset,
-        training_data,
-        explicit_path=args.activation_cache,
-    )
+    # Convert cached activations into raw, VQ, or hybrid response sequences.
+    if args.activation_cache is None:
+        raise ValueError("--activation-cache is required when the VQ checkpoint does not record one")
+    activation_cache = Path(args.activation_cache)
     activation_sequences = load_activation_sequences(activation_cache, args.activation_layer)
     if uses_vq:
         retain_response_activations = (
             args.input_representation == "hybrid" or args.code_vector_source == "activation_mean"
         )
-        sequences = (
-            assign_hybrid_sequences(vq_model, activation_sequences, device, args.code_batch_size)
-            if retain_response_activations
+        sequences = assign_hybrid_sequences(vq_model, activation_sequences, device, args.code_batch_size) \
+            if retain_response_activations \
             else assign_code_sequences(vq_model, activation_sequences, device, args.code_batch_size)
-        )
         vq_codebook = vq_model.quantizer.codebook.detach().float().cpu().clone()
         activation_dim = int(activation_sequences[0]["x"].shape[1])
         del activation_sequences, vq_model
@@ -300,6 +296,7 @@ def prepare_data(args, device):
         pad_batch, score_sequences = pad_activation_batch, score_activation_sequences
         activation_dim, num_codes, vq_codebook = int(sequences[0]["x"].shape[1]), None, None
 
+    # Use the same split and fixed concept statistics for every trial.
     train, validation = train_validation_split(sequences, split_seed)
     labels = np.array([sequence["label"] for sequence in train])
     n_safe, n_harmful = int((labels == 0).sum()), int((labels == 1).sum())
@@ -311,11 +308,19 @@ def prepare_data(args, device):
         if args.code_vector_source == "activation_mean":
             codebook, code_vector_counts = activation_mean_code_vectors(train, vq_codebook)
             if args.input_representation == "vq":
-                train = [{name: value for name, value in sequence.items() if name != "x"} for sequence in train]
-                validation = [
-                    {name: value for name, value in sequence.items() if name != "x"}
-                    for sequence in validation
-                ]
+                stripped_train = []
+                for sequence in train:
+                    sequence = dict(sequence)
+                    sequence.pop("x", None)
+                    stripped_train.append(sequence)
+                train = stripped_train
+
+                stripped_validation = []
+                for sequence in validation:
+                    sequence = dict(sequence)
+                    sequence.pop("x", None)
+                    stripped_validation.append(sequence)
+                validation = stripped_validation
         code_features, code_statistics = checkpoint_code_feature_statistics(
             checkpoint_regions, train, num_codes, expected_prior_strength=10.0
         )
@@ -366,13 +371,11 @@ def main():
     prepared = prepare_data(args, device)
     args.seed = prepared.split_seed
 
+    # Create or reopen the Optuna study for this detector representation.
     objective_suffix = "" if args.objective == "mean_ap" else f"_{args.objective}"
-    default_name = (
-        f"optuna_{args.trials}_{args.input_representation}_gru_"
-        f"layer{args.activation_layer}{objective_suffix}"
-    )
+    default_name = f"optuna_{args.trials}_{args.input_representation}_gru_layer{args.activation_layer}{objective_suffix}"
     run_dir = (
-        resolve_project_path(args.out) if args.out
+        Path(args.out) if args.out
         else DETECTION_RUNS_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{default_name}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -449,6 +452,7 @@ def main():
             torch.cuda.empty_cache()
         return value
 
+    # Search the remaining trials unless this run only finalizes an existing study.
     if not args.finalize_existing_study:
         finished_trials = sum(trial.state.is_finished() for trial in study.trials)
         remaining_trials = max(0, args.trials - finished_trials)
@@ -458,8 +462,14 @@ def main():
         trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE
     ]
 
+    # Retrain the winning configuration and select its validation thresholds.
+    best_trial_parameters = dict(study.best_trial.params)
+    legacy_weight = best_trial_parameters.pop("code_score_skip_scale", None)
+    if "harmfulness_score_weight" not in best_trial_parameters and legacy_weight is not None:
+        # Existing studies used the earlier name for the same scalar.
+        best_trial_parameters["harmfulness_score_weight"] = legacy_weight
     best_parameters = suggest_hyperparameters(
-        optuna.trial.FixedTrial(study.best_trial.params), args.input_representation,
+        optuna.trial.FixedTrial(best_trial_parameters), args.input_representation,
         args.raw_projection_dim, args.vq_projection_dim,
     )
     print(f"\n  retraining winning trial {study.best_trial.number}: {best_parameters}", flush=True)
@@ -473,6 +483,8 @@ def main():
         ),
     }
     validation_report = threshold_report(winner["validation_scores"], thresholds)
+
+    # Save the final checkpoint and a complete record of the search.
     config = {
         "input_representation": args.input_representation,
         "dataset": args.dataset,
@@ -568,7 +580,7 @@ def main():
         config["activation_dim"] = prepared.activation_dim
 
     torch.save(classifier_checkpoint, run_dir / "classifier.pt")
-    json.dump(validation_report, open(run_dir / "validation_report.json", "w"), indent=2)
+    (run_dir / "validation_report.json").write_text(json.dumps(validation_report, indent=2) + "\n")
     search_summary = {
         "input_representation": args.input_representation,
         "code_vector_source": args.code_vector_source if args.input_representation in {"vq", "hybrid"} else None,
@@ -594,7 +606,9 @@ def main():
         "trials": serialize_trials(study),
         "winning_history": winner["history"],
     }
-    json.dump(search_summary, open(run_dir / "search_summary.json", "w"), indent=2)
+    (run_dir / "search_summary.json").write_text(json.dumps(search_summary, indent=2) + "\n")
+    if args.run_path_file:
+        Path(args.run_path_file).write_text(str(run_dir))
     print(f"  classifier  : {run_dir / 'classifier.pt'}", flush=True)
     print(f"  summary     : {run_dir / 'search_summary.json'}", flush=True)
 

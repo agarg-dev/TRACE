@@ -1,1 +1,1 @@
-"""Layer selection and concept audit for TRACE."""
+"""Offline diagnostics and exploratory analyses."""

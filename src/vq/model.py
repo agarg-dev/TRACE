@@ -1,8 +1,10 @@
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from torch.utils.checkpoint import checkpoint
 
 
@@ -11,7 +13,7 @@ class VectorQuantizerEMA(nn.Module):
 
     def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.1,
                  perplexity_weight=0.01, decay=0.99, epsilon=1e-5,
-                 top_k=10, temperature=1.0,
+                 use_sampling=True, top_k=10, temperature=1.0,
                  dcr_enabled=True, dcr_count_threshold=1.0,
                  dcr_patience_steps=100, dcr_max_resets_per_step=5):
         super().__init__()
@@ -19,6 +21,7 @@ class VectorQuantizerEMA(nn.Module):
         self._embedding_dim = embedding_dim
         self._commitment_cost = commitment_cost
         self._perplexity_weight = perplexity_weight
+        self._use_sampling = use_sampling
         self._top_k = min(top_k, num_embeddings)
         self._temperature = temperature
         self.dcr_enabled = dcr_enabled
@@ -48,21 +51,7 @@ class VectorQuantizerEMA(nn.Module):
     def codebook(self):
         return self._embedding.weight
 
-    def get_usage_stats(self):
-        counts = self._usage_count.detach().cpu()
-        total = counts.sum().item()
-        fractions = counts / total if total > 0 else torch.zeros_like(counts)
-        active_codes = int((counts > 0).sum().item())
-        return {
-            "usage_count": counts, "usage_fraction": fractions,
-            "active_codes": active_codes, "total_codes": self.num_codes,
-            "code_utilization": active_codes / self.num_codes,
-        }
-
-    def reset_usage_stats(self):
-        self._usage_count.zero_()
-
-    def sample_from_distances(self, distances):
+    def _sample_from_distances(self, distances):
         nearest_distances, nearest_codes = torch.topk(distances, k=self._top_k, dim=1, largest=False)
         probabilities = F.softmax(-nearest_distances / self._temperature, dim=1)
         sampled_column = torch.multinomial(probabilities, 1)
@@ -102,8 +91,8 @@ class VectorQuantizerEMA(nn.Module):
             valid_inputs.pow(2).sum(dim=1, keepdim=True)
             + codebook.pow(2).sum(dim=1) - 2 * valid_inputs @ codebook.t()
         )
-        if self.training:
-            code_indices, minimum_distances = self.sample_from_distances(distances)
+        if self._use_sampling and self.training:
+            code_indices, minimum_distances = self._sample_from_distances(distances)
         else:
             minimum_distances, code_indices = distances.min(dim=1)
 
@@ -116,7 +105,10 @@ class VectorQuantizerEMA(nn.Module):
         if self.training:
             with torch.no_grad():
                 batch_counts = assignments.sum(dim=0)
-                self._ema_cluster_size = self._ema_cluster_size * self._decay + (1 - self._decay) * batch_counts
+                self._ema_cluster_size = (
+                    self._ema_cluster_size * self._decay
+                    + (1 - self._decay) * batch_counts
+                )
                 total_count = self._ema_cluster_size.data.sum()
                 self._ema_cluster_size = (
                     (self._ema_cluster_size + self._epsilon)
@@ -175,24 +167,83 @@ class VectorQuantizerEMA(nn.Module):
         flat_indices[valid_mask] = valid_indices
         return flat_indices.view(input_shape[:-1])
 
+    def get_usage_stats(self):
+        counts = self._usage_count.detach().cpu()
+        total = counts.sum().item()
+        fractions = counts / total if total > 0 else torch.zeros_like(counts)
+        active_codes = int((counts > 0).sum().item())
+        return {
+            "usage_count": counts, "usage_fraction": fractions,
+            "active_codes": active_codes, "total_codes": self.num_codes,
+            "code_utilization": active_codes / self.num_codes,
+        }
+
+    def reset_usage_stats(self):
+        self._usage_count.zero_()
+
+    def compute_similarity_metrics(self):
+        """Measure pairwise similarity among codes used since the last reset."""
+        active_codes = torch.where(self._usage_count > 0)[0].cpu().numpy()
+        metric_names = (
+            "cosine_mean_similarity", "cosine_min_similarity", "cosine_max_similarity",
+            "euclidean_mean_distance", "euclidean_min_distance", "euclidean_max_distance",
+        )
+        if len(active_codes) < 2:
+            return {name: 0.0 for name in metric_names}
+
+        codebook = self.codebook.detach().cpu().numpy()[active_codes]
+        cosine = cosine_similarity(codebook)
+        euclidean = euclidean_distances(codebook)
+        off_diagonal = ~np.eye(len(active_codes), dtype=bool)
+
+        return {
+            "cosine_mean_similarity": float(cosine[off_diagonal].mean()),
+            "cosine_min_similarity": float(cosine[off_diagonal].min()),
+            "cosine_max_similarity": float(cosine[off_diagonal].max()),
+            "euclidean_mean_distance": float(euclidean[off_diagonal].mean()),
+            "euclidean_min_distance": float(euclidean[off_diagonal].min()),
+            "euclidean_max_distance": float(euclidean[off_diagonal].max()),
+        }
+
+
+def causal_mask(size, device=None):
+    """Boolean attention mask; position i can attend only to positions <= i."""
+    return torch.triu(torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1)
+
 
 class AdaptiveResidualEncoder(nn.Module):
     """Blend x with a learned normalized projection: (1-mix)x + mix*LN(Wx+b)."""
 
-    def __init__(self, embedding_dim):
+    def __init__(self, embedding_dim, fixed_alpha=None):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.linear = nn.Linear(embedding_dim, embedding_dim)
         self.layer_norm = nn.LayerNorm(embedding_dim)
-        self.alpha = nn.Parameter(torch.tensor(0.2))
+        if fixed_alpha is None:
+            self.alpha = nn.Parameter(torch.tensor(0.2))
+            self.is_fixed = False
+        else:
+            self.register_buffer("alpha", torch.tensor(float(fixed_alpha)))
+            self.is_fixed = True
 
     def forward(self, activations, padding_mask=None):
-        mix = torch.sigmoid(self.alpha) * 0.5
+        mix = (self.alpha if self.is_fixed else torch.sigmoid(self.alpha)) * 0.5
         transformed = self.layer_norm(self.linear(activations))
         encoded = (1 - mix) * activations + mix * transformed
         if padding_mask is not None:
             encoded = encoded.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         return encoded
+
+
+class PassThroughEncoder(nn.Module):
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+
+    def forward(self, activations, padding_mask=None):
+        if padding_mask is None:
+            return activations
+        return activations.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
 
 def _rope_tables(sequence_length, head_dim, device, base=10000.0):
@@ -278,38 +329,79 @@ class CausalSelfAttnHead(nn.Module):
     def forward(self, source):
         hidden_states = source
         for layer in self.layers:
-            hidden_states = (
-                checkpoint(layer, hidden_states, use_reentrant=False)
-                if self.training else layer(hidden_states)
-            )
+            if self.training:
+                hidden_states = checkpoint(layer, hidden_states, use_reentrant=False)
+            else:
+                hidden_states = layer(hidden_states)
         return self.output_projection(hidden_states)
 
 
-class CrossLayerVQVAE(nn.Module):
-    """Quantize one residual layer and causally reconstruct a later layer.
+class CrossAttnHead(nn.Module):
+    """Ablation decoder that cross-attends to unquantized encoder activations."""
 
-    The unusual registered names are retained because they are part of existing
-    checkpoint state-dict keys. Use the readable properties elsewhere in the code.
-    """
-
-    def __init__(self, num_embeddings, embedding_dim, decoder_layers=4,
-                 perplexity_weight=0.01, top_k=10, temperature=1.0,
-                 commitment_cost=0.1, nhead=8, ff_mult=3, dropout=0.0,
-                 dcr_enabled=True, dcr_count_threshold=1.0,
-                 dcr_patience_steps=100, dcr_max_resets_per_step=5):
+    def __init__(self, model_dim, output_dim, num_heads=8, num_layers=4, feedforward_dim=2048,
+                 dropout=0.1, activation="gelu", norm_first=True):
         super().__init__()
-        self._ContinuousEmbedding = AdaptiveResidualEncoder(embedding_dim)
+        layer = nn.TransformerDecoderLayer(
+            d_model=model_dim, nhead=num_heads, dim_feedforward=feedforward_dim,
+            dropout=dropout, activation=activation, norm_first=norm_first
+        )
+        self.transformer = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.output_projection = nn.Linear(model_dim, output_dim)
+
+    def forward(self, target, memory, target_mask=None, memory_mask=None,
+                target_padding_mask=None, memory_padding_mask=None):
+        decoded = self.transformer(
+            target, memory, tgt_mask=target_mask, memory_mask=memory_mask,
+            tgt_key_padding_mask=target_padding_mask, memory_key_padding_mask=memory_padding_mask
+        )
+        return self.output_projection(decoded)
+
+
+class CrossLayerVQVAE(nn.Module):
+    """Quantize one residual layer and causally reconstruct a later layer."""
+
+    def __init__(self, num_embeddings, embedding_dim, output_dim=None, decoder_layers=4,
+                 perplexity_weight=0.01, use_sampling=True, top_k=10, temperature=1.0,
+                 use_adaptive_encoder=True, fixed_alpha=None, commitment_cost=0.1,
+                 no_residual=True, causal=True, nhead=8, ff_mult=3, dropout=0.0,
+                 activation="gelu", norm_first=True, dcr_enabled=True,
+                 dcr_count_threshold=1.0, dcr_patience_steps=100, dcr_max_resets_per_step=5,
+                 activation_normalization="none", read_activation_scale=1.0,
+                 target_activation_scale=1.0):
+        super().__init__()
+        output_dim = embedding_dim if output_dim is None else output_dim
+        self.no_residual = no_residual
+        self.causal = causal
+        self.activation_normalization = activation_normalization
+        self.register_buffer(
+            "_read_activation_scale", torch.tensor(float(read_activation_scale)), persistent=False
+        )
+        self.register_buffer(
+            "_target_activation_scale", torch.tensor(float(target_activation_scale)), persistent=False
+        )
+
+        self._ContinuousEmbedding = (
+            AdaptiveResidualEncoder(embedding_dim, fixed_alpha)
+            if use_adaptive_encoder else PassThroughEncoder(embedding_dim)
+        )
         self._VectorQuantizer = VectorQuantizerEMA(
             num_embeddings, embedding_dim, commitment_cost=commitment_cost,
-            perplexity_weight=perplexity_weight, top_k=top_k,
+            perplexity_weight=perplexity_weight, use_sampling=use_sampling, top_k=top_k,
             temperature=temperature, dcr_enabled=dcr_enabled,
             dcr_count_threshold=dcr_count_threshold, dcr_patience_steps=dcr_patience_steps,
             dcr_max_resets_per_step=dcr_max_resets_per_step
         )
         feedforward_dim = int(ff_mult * embedding_dim)
-        self._encoder = CausalSelfAttnHead(
-            embedding_dim, embedding_dim, nhead, decoder_layers, feedforward_dim, dropout
-        )
+        if no_residual:
+            self._encoder = CausalSelfAttnHead(
+                embedding_dim, output_dim, nhead, decoder_layers, feedforward_dim, dropout
+            )
+        else:
+            self._decoder = CrossAttnHead(
+                embedding_dim, output_dim, nhead, decoder_layers, feedforward_dim,
+                dropout, activation, norm_first
+            )
 
     @property
     def activation_encoder(self):
@@ -319,21 +411,61 @@ class CrossLayerVQVAE(nn.Module):
     def quantizer(self):
         return self._VectorQuantizer
 
-    def encode_activations(self, activations, padding_mask=None):
-        return self.activation_encoder(activations, padding_mask=padding_mask)
+    @property
+    def read_activation_scale(self):
+        return float(self._read_activation_scale.detach().cpu())
 
-    def forward(self, activations):
+    @property
+    def target_activation_scale(self):
+        return float(self._target_activation_scale.detach().cpu())
+
+    def normalize_read_activations(self, activations):
+        if self.activation_normalization == "none":
+            return activations
+        return activations / self._read_activation_scale.to(
+            device=activations.device, dtype=activations.dtype
+        )
+
+    def normalize_target_activations(self, activations):
+        if self.activation_normalization == "none":
+            return activations
+        return activations / self._target_activation_scale.to(
+            device=activations.device, dtype=activations.dtype
+        )
+
+    def denormalize_target_activations(self, activations):
+        if self.activation_normalization == "none":
+            return activations
+        return activations * self._target_activation_scale.to(
+            device=activations.device, dtype=activations.dtype
+        )
+
+    def encode_activations(self, activations, padding_mask=None):
+        normalized = self.normalize_read_activations(activations)
+        return self.activation_encoder(normalized, padding_mask=padding_mask)
+
+    def forward(self, activations, target_embedding=None, device=None):
         activations = activations.contiguous()
         padding_mask = torch.norm(activations, dim=2) <= 1e-6
         encoded = self.encode_activations(activations, padding_mask=padding_mask)
+        encoded = encoded.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
         device_type = "cuda" if activations.is_cuda else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             vq_output = self.quantizer(encoded.float())
         quantized = vq_output["quantized"].to(encoded.dtype)
 
+        encoded_sequence = encoded.transpose(0, 1)
         quantized_sequence = quantized.transpose(0, 1)
-        reconstructed = self._encoder(quantized_sequence).transpose(0, 1)
+        if self.no_residual:
+            reconstructed_sequence = self._encoder(quantized_sequence)
+        else:
+            mask = causal_mask(quantized_sequence.size(0), activations.device) if self.causal else None
+            reconstructed_sequence = self._decoder(
+                quantized_sequence, encoded_sequence, target_mask=mask, memory_mask=mask,
+                target_padding_mask=padding_mask, memory_padding_mask=padding_mask
+            )
+        reconstructed = self.denormalize_target_activations(reconstructed_sequence.transpose(0, 1))
         reconstructed = reconstructed.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
         return {
@@ -352,6 +484,7 @@ class CrossLayerVQVAE(nn.Module):
         activations = activations.contiguous()
         padding_mask = torch.norm(activations, dim=2) <= 1e-6
         encoded = self.encode_activations(activations, padding_mask=padding_mask)
+        encoded = encoded.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         device_type = "cuda" if activations.is_cuda else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             return self.quantizer.assign_indices(encoded.float())
@@ -361,7 +494,7 @@ class CrossLayerVQVAE(nn.Module):
 
 
 def load_vq_checkpoint(checkpoint_path, device, freeze=True):
-    """Strictly load a VQ state dict and return its model and checkpoint metadata."""
+    """Load a VQ model and its checkpoint metadata."""
     checkpoint_path = Path(checkpoint_path)
     saved_checkpoint = torch.load(checkpoint_path, map_location="cpu")
     num_codes, activation_dim = saved_checkpoint["codebook"].shape
@@ -373,6 +506,9 @@ def load_vq_checkpoint(checkpoint_path, device, freeze=True):
         nhead=config.get("nhead", 8),
         ff_mult=config.get("ff_mult", 3),
         dropout=config.get("dropout", 0.0),
+        activation_normalization=config.get("activation_normalization", "none"),
+        read_activation_scale=config.get("read_activation_scale", 1.0),
+        target_activation_scale=config.get("target_activation_scale", 1.0),
     ).to(device)
     model.load_state_dict(saved_checkpoint["model"], strict=True)
     if freeze:

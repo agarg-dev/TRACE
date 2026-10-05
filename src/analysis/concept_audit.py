@@ -5,13 +5,34 @@ import argparse
 import csv
 import gzip
 import json
+import os
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "trace_matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "trace_plot_cache"))
+
+import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 
 
 SAFETY_LABELS = ("harmful", "neutral", "benign", "safety_ambiguous", "unresolved")
+SAFETY_COLORS = {
+    "harmful": "#cc6b5e",
+    "neutral": "#9aa8af",
+    "benign": "#77a982",
+    "safety_ambiguous": "#c4a56a",
+    "unresolved": "#d9dfe2",
+}
+SAFETY_NAMES = {
+    "harmful": "Harmful",
+    "neutral": "Neutral",
+    "benign": "Benign",
+    "safety_ambiguous": "Safety ambiguous",
+    "unresolved": "No agreed concept",
+}
 
 
 def _json_dump(value, path):
@@ -19,6 +40,12 @@ def _json_dump(value, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as output_file:
         json.dump(value, output_file, indent=2, ensure_ascii=False)
+
+
+def _numpy(value, dtype=None):
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=dtype)
 
 
 def write_detection_cache(output_dir, scored, code_features, metadata):
@@ -30,17 +57,29 @@ def write_detection_cache(output_dir, scored, code_features, metadata):
     if arrays_path.exists() or manifest_path.exists():
         raise FileExistsError(f"detection audit cache already exists: {output_dir}")
 
+    required = ("conditional_hazards", "response_token_scores", "token_scores")
+    missing = [name for name in required if name not in scored]
+    if missing:
+        raise ValueError(f"detector scores are missing token details: {missing}")
+
     response_ids, labels, offsets = [], [], [0]
     token_ids, code_ids = [], []
     hazards, cumulative_risks, response_probabilities = [], [], []
     for index, sequence in enumerate(scored["sequences"]):
-        codes = np.asarray(sequence["codes"], dtype=np.int32).reshape(-1)
-        tokens = np.asarray(sequence["token_ids"], dtype=np.int32).reshape(-1)
-        hazard = np.asarray(scored["conditional_hazards"][index], dtype=np.float32).reshape(-1)
-        cumulative = np.asarray(scored["token_scores"][index], dtype=np.float32).reshape(-1)
-        response = np.asarray(scored["response_token_scores"][index], dtype=np.float32).reshape(-1)
+        codes = _numpy(sequence.get("codes"), np.int32).reshape(-1)
+        tokens = _numpy(sequence.get("token_ids"), np.int32).reshape(-1)
+        hazard = _numpy(scored["conditional_hazards"][index], np.float32).reshape(-1)
+        cumulative = _numpy(scored["token_scores"][index], np.float32).reshape(-1)
+        response = _numpy(scored["response_token_scores"][index], np.float32).reshape(-1)
+        lengths = {len(codes), len(tokens), len(hazard), len(cumulative), len(response)}
+        if len(lengths) != 1 or not lengths or next(iter(lengths)) < 1:
+            raise ValueError(f"unaligned token details for response {sequence.get('idx', index)}")
+        if not np.isclose(cumulative[-1], scored["streaming_scores"][index], atol=1e-6):
+            raise ValueError("cached cumulative risk does not match the evaluated streaming score")
+        if not np.isclose(response[-1], scored["response_scores"][index], atol=1e-6):
+            raise ValueError("cached response probability does not match the evaluated response score")
 
-        response_ids.append(int(sequence["idx"]))
+        response_ids.append(int(sequence.get("idx", index)))
         labels.append(int(sequence["label"]))
         token_ids.append(tokens)
         code_ids.append(codes)
@@ -48,6 +87,9 @@ def write_detection_cache(output_dir, scored, code_features, metadata):
         cumulative_risks.append(cumulative)
         response_probabilities.append(response)
         offsets.append(offsets[-1] + len(codes))
+
+    if len(response_ids) != len(set(response_ids)):
+        raise ValueError("response IDs must be unique in a detection audit cache")
 
     np.savez_compressed(
         arrays_path,
@@ -59,10 +101,11 @@ def write_detection_cache(output_dir, scored, code_features, metadata):
         conditional_hazards=np.concatenate(hazards),
         cumulative_risks=np.concatenate(cumulative_risks),
         response_probabilities=np.concatenate(response_probabilities),
-        code_features=np.asarray(code_features, dtype=np.float32),
+        code_features=_numpy(code_features, np.float32),
     )
     manifest = {
         "format": "trace_detection_audit_cache",
+        "format_version": 1,
         "arrays_file": arrays_path.name,
         "n_responses": len(response_ids),
         "n_tokens": offsets[-1],
@@ -87,6 +130,7 @@ def initialize_steering_cache(output_dir, metadata, resume=False):
     events_path = output_dir / "responses.jsonl.gz"
     manifest = {
         "format": "trace_steering_audit_cache",
+        "format_version": 1,
         "events_file": events_path.name,
         "fields": {
             "output_code_ids": "codes assigned when the completed output is rescored",
@@ -108,6 +152,8 @@ def initialize_steering_cache(output_dir, metadata, resume=False):
             for line in input_file:
                 row = json.loads(line)
                 key = (int(row["response_id"]), row["result_key"])
+                if key in existing_keys:
+                    raise ValueError(f"duplicate steering audit record: {key}")
                 existing_keys.add(key)
     else:
         if manifest_path.exists() or events_path.exists():
@@ -140,11 +186,16 @@ def _concept_reference(code_id, catalog):
     row = catalog.get(int(code_id))
     if row is None or not row.get("clear_consensus"):
         return {"code_id": int(code_id), "name": None, "safety_label": "unresolved"}
+    safety_label = row.get("safety_consensus")
+    if safety_label is None:
+        safety_label = "safety_ambiguous"
+    elif safety_label not in {"harmful", "neutral", "benign"}:
+        raise ValueError(f"unknown safety label for concept C{code_id}: {safety_label!r}")
     return {
         "code_id": int(code_id),
         "name": row.get("consensus_name"),
         "description": row.get("consensus_description"),
-        "safety_label": row.get("safety_consensus") or "safety_ambiguous",
+        "safety_label": safety_label,
     }
 
 
@@ -170,26 +221,29 @@ def _prefix_run_summary(codes, catalog):
     codes = np.asarray(codes, dtype=np.int32)
     run_codes = codes[np.r_[True, codes[1:] != codes[:-1]]]
     code_counts = Counter(int(code) for code in run_codes)
-    references = {code: _concept_reference(code, catalog) for code in code_counts}
     label_counts = Counter()
     for code, count in code_counts.items():
-        label_counts[references[code]["safety_label"]] += count
+        label_counts[_concept_reference(code, catalog)["safety_label"]] += count
 
     dominant = {}
     for safety_label in ("harmful", "benign"):
-        candidates = [
-            (count, code) for code, count in code_counts.items()
-            if references[code]["safety_label"] == safety_label
-        ]
+        candidates = []
+        for code, count in code_counts.items():
+            concept = _concept_reference(code, catalog)
+            if concept["safety_label"] == safety_label:
+                candidates.append((count, code))
         if not candidates:
             dominant[safety_label] = []
             continue
         max_count = max(count for count, _ in candidates)
-        dominant[safety_label] = [
-            {**references[code], "run_count": count}
-            for count, code in sorted(candidates, key=lambda item: item[1])
-            if count == max_count
-        ]
+        dominant_concepts = []
+        for count, code in sorted(candidates, key=lambda item: item[1]):
+            if count == max_count:
+                dominant_concepts.append({
+                    **_concept_reference(code, catalog),
+                    "run_count": count,
+                })
+        dominant[safety_label] = dominant_concepts
     return {
         "n_runs": len(run_codes),
         "n_distinct_codes": len(code_counts),
@@ -212,14 +266,146 @@ def _response_balanced_prefix_summary(prefixes):
     }
 
 
+def _plot_label_bars(rows, output_path, title):
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Liberation Sans", "Arial", "DejaVu Sans"],
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 8,
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+    })
+    figure, axis = plt.subplots(figsize=(4.35, 1.75))
+    positions = np.arange(len(rows))
+    left = np.zeros(len(rows))
+    for label in SAFETY_LABELS:
+        values = np.asarray([100 * (row["fractions"].get(label) or 0.0) for row in rows])
+        axis.barh(
+            positions, values, left=left, height=0.55, label=label.capitalize(),
+            color=SAFETY_COLORS[label], edgecolor="white", linewidth=0.6,
+        )
+        left += values
+    axis.set_yticks(positions, [row["name"] for row in rows])
+    axis.invert_yaxis()
+    axis.set_xlim(0, 100)
+    axis.set_xlabel("Responses (%)")
+    axis.set_title(title, pad=9)
+    for spine in ("top", "right", "left"):
+        axis.spines[spine].set_visible(False)
+    axis.tick_params(axis="y", length=0)
+    axis.grid(axis="x", color="#e2e7e9", linewidth=0.7)
+    axis.set_axisbelow(True)
+    axis.legend(
+        handles=[plt.Rectangle((0, 0), 1, 1, color=SAFETY_COLORS[label]) for label in SAFETY_LABELS],
+        labels=[SAFETY_NAMES[label] for label in SAFETY_LABELS],
+        loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=5,
+        frameon=False, fontsize=7, handlelength=1.2, columnspacing=1.2,
+    )
+    figure.tight_layout()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _plot_recurring_detection_concepts(rows, outcome_counts, output_path, top_n=3):
+    """Compare named concepts that recur before correct detections and false alarms."""
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Liberation Sans", "Arial", "DejaVu Sans"],
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+    })
+    outcomes = ("true_positive", "false_positive")
+    outcome_labels = {
+        "true_positive": "Correct harmful detections",
+        "false_positive": "False alarms",
+    }
+    outcome_colors = {"true_positive": "#318579", "false_positive": "#c76a5b"}
+    lookup = {
+        (row["outcome"], row["safety_label"], row["code_id"]): row for row in rows
+    }
+
+    selected = {}
+    maximum = 0.0
+    for safety_label in ("harmful", "benign"):
+        candidates = [row for row in rows if row["safety_label"] == safety_label]
+        code_ids = sorted({row["code_id"] for row in candidates}, key=lambda code_id: (
+            -lookup.get(("true_positive", safety_label, code_id), {}).get("recurrent_responses", 0),
+            -lookup.get(("false_positive", safety_label, code_id), {}).get("recurrent_responses", 0),
+            code_id,
+        ))[:top_n]
+        selected[safety_label] = code_ids
+        for code_id in code_ids:
+            for outcome in outcomes:
+                count = lookup.get((outcome, safety_label, code_id), {}).get("recurrent_responses", 0)
+                maximum = max(maximum, 100 * count / outcome_counts[outcome])
+
+    figure, axes = plt.subplots(2, 1, figsize=(6.7, 3.65), sharex=True)
+    for axis, safety_label in zip(axes, ("harmful", "benign")):
+        code_ids = selected[safety_label]
+        positions = np.arange(len(code_ids))
+        for offset, outcome in zip((-0.17, 0.17), outcomes):
+            values = []
+            for code_id in code_ids:
+                row = lookup.get((outcome, safety_label, code_id), {})
+                percentage = 100 * row.get("recurrent_responses", 0) / outcome_counts[outcome]
+                values.append(percentage)
+            axis.barh(
+                positions + offset, values, height=0.30,
+                color=outcome_colors[outcome], label=outcome_labels[outcome],
+            )
+        names = []
+        for code_id in code_ids:
+            row = next(
+                (lookup.get((outcome, safety_label, code_id)) for outcome in outcomes
+                 if lookup.get((outcome, safety_label, code_id)) is not None),
+                None,
+            )
+            name = row["concept_name"] if row else None
+            names.append(f"C{code_id}  {name or 'Unnamed concept'}")
+        axis.set_yticks(positions, names)
+        axis.invert_yaxis()
+        axis.set_title(f"{safety_label.capitalize()} concepts", loc="left", pad=5)
+        axis.grid(axis="x", color="#e1e7e9", linewidth=0.7)
+        axis.set_axisbelow(True)
+        axis.tick_params(axis="y", length=0)
+        for spine in ("top", "right", "left"):
+            axis.spines[spine].set_visible(False)
+    upper = max(5, int(np.ceil(maximum / 5) * 5))
+    axes[0].set_xlim(0, upper)
+    figure.supxlabel("Detected responses with at least two separated occurrences (%)", y=0.02, fontsize=8)
+    handles, labels = axes[0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.93), ncol=2, frameon=False)
+    figure.suptitle("Concepts recurring before detection", y=1.0, fontsize=10)
+    figure.subplots_adjust(left=0.44, right=0.98, bottom=0.15, top=0.78, hspace=0.60)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
+
+
 def analyze_detection(cache_dir, concept_path, threshold_name, output_dir):
     """Connect detector decisions to concepts at their strongest conditional hazard."""
+    # Load the concept catalog and the detector threshold used for this analysis.
     cache_dir, output_dir = Path(cache_dir), Path(output_dir)
     manifest = json.loads((cache_dir / "manifest.json").read_text())
     if manifest.get("format") != "trace_detection_audit_cache":
         raise ValueError(f"not a detection audit cache: {cache_dir}")
     _, catalog = _load_catalog(concept_path)
-    threshold = float(manifest["streaming_thresholds"][threshold_name])
+    try:
+        threshold = float(manifest["streaming_thresholds"][threshold_name])
+    except KeyError as error:
+        choices = ", ".join(manifest.get("streaming_thresholds", {}))
+        raise ValueError(f"unknown threshold {threshold_name!r}; choose {choices}") from error
 
     with np.load(cache_dir / manifest["arrays_file"], allow_pickle=False) as arrays:
         response_ids = arrays["response_ids"]
@@ -228,12 +414,19 @@ def analyze_detection(cache_dir, concept_path, threshold_name, output_dir):
         code_ids = arrays["code_ids"]
         hazards = arrays["conditional_hazards"]
         risks = arrays["cumulative_risks"]
+        if len(offsets) != len(response_ids) + 1 or offsets[-1] != len(code_ids):
+            raise ValueError("invalid response offsets in detection audit cache")
+        if not (len(code_ids) == len(hazards) == len(risks)):
+            raise ValueError("unaligned arrays in detection audit cache")
+
         events = []
         prefixes_by_outcome = defaultdict(list)
         recurring_concepts = defaultdict(lambda: {
             "runs": 0, "responses": 0, "recurrent_responses": 0,
             "dominant_response_votes": 0.0,
         })
+
+        # Reconstruct each response trace up to its first threshold crossing.
         for index, response_id in enumerate(response_ids):
             start, end = int(offsets[index]), int(offsets[index + 1])
             response_risks = risks[start:end]
@@ -290,11 +483,13 @@ def analyze_detection(cache_dir, concept_path, threshold_name, output_dir):
                 event["crossing_concept"] = _concept_reference(int(code_ids[start + crossing]), catalog)
             events.append(event)
 
+    # Save the response-level trace summaries before aggregating across outcomes.
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "detection_events.jsonl").open("w") as output_file:
         for event in events:
             output_file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
+    # Rank concepts that recur within correctly and incorrectly detected responses.
     recurring_rows = []
     for (outcome, safety_label, code), counts in recurring_concepts.items():
         if outcome not in {"true_positive", "false_positive"}:
@@ -324,16 +519,18 @@ def analyze_detection(cache_dir, concept_path, threshold_name, output_dir):
     for outcome in ("true_positive", "false_positive"):
         most_repeated[outcome] = {}
         for safety_label in ("harmful", "benign"):
-            candidates = [
-                row for row in recurring_rows
-                if row["outcome"] == outcome and row["safety_label"] == safety_label
-            ]
+            candidates = []
+            for row in recurring_rows:
+                if row["outcome"] == outcome and row["safety_label"] == safety_label:
+                    candidates.append(row)
             most_repeated[outcome][safety_label] = candidates[0] if candidates else None
 
     grouped = {}
     for outcome in ("true_positive", "false_positive", "false_negative", "true_negative"):
         references = [event["strongest_signal_concept"] for event in events if event["outcome"] == outcome]
         grouped[outcome] = _label_summary(references)
+
+    # Collect the aggregate tables and figures used by the paper.
     summary = {
         "analysis": "concepts at the strongest conditional hazard before the detector decision",
         "cache": str(cache_dir),
@@ -354,6 +551,12 @@ def analyze_detection(cache_dir, concept_path, threshold_name, output_dir):
         "recurring_concepts_file": "recurring_detection_concepts.csv",
     }
     _json_dump(summary, output_dir / "detection_summary.json")
+    _plot_recurring_detection_concepts(
+        recurring_rows, summary["outcomes"], output_dir / "detection_concepts.pdf"
+    )
+    _plot_recurring_detection_concepts(
+        recurring_rows, summary["outcomes"], output_dir / "detection_concepts.svg"
+    )
     return summary
 
 
@@ -399,13 +602,14 @@ def _normalized_concept_name(name):
 
 def _response_level_intervention_records(rows, catalog):
     """Summarize independently labeled harmful sources and benign targets by response."""
-    harmful_rows = [row for row in rows if row["label"] == 1]
+    harmful_rows = [row for row in rows if int(row["label"]) == 1]
     edited_rows = [row for row in harmful_rows if row["edit_positions"]]
     source_responses, target_responses, pair_responses = defaultdict(set), defaultdict(set), defaultdict(set)
     source_names, target_names = defaultdict(Counter), defaultdict(Counter)
     pair_names = defaultdict(lambda: {"source": Counter(), "target": Counter()})
     pair_codes = defaultdict(set)
 
+    # Count each named concept or concept pair at most once per response.
     for row in edited_rows:
         response_id = int(row["response_id"])
         source_codes = set(map(int, row["source_code_ids"]))
@@ -485,8 +689,130 @@ def _response_level_intervention_records(rows, catalog):
     }
 
 
+def _plot_intervention_roles(records, output_path, top_n=5):
+    """Plot harmful source concepts and benign targets separately at response level."""
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Liberation Sans", "Arial", "DejaVu Sans"],
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+    })
+    panels = [
+        ("harmful_source_concepts", "Harmful concept triggering edit", SAFETY_COLORS["harmful"]),
+        ("benign_target_concepts", "Benign concept used as target", SAFETY_COLORS["benign"]),
+    ]
+    figure, axes = plt.subplots(1, 2, figsize=(7.2, 2.55), sharex=True)
+    denominator = records["n_edited_harmful_responses"]
+    for axis, (field, title, color) in zip(axes, panels):
+        selected = records[field][:top_n][::-1]
+        values = [100 * row["response_fraction"] for row in selected]
+        positions = np.arange(len(selected))
+        labels = ["\n".join(_wrap_label(row["name"], 29)) for row in selected]
+        axis.barh(positions, values, height=0.62, color=color, edgecolor="white", linewidth=0.6)
+        axis.set_yticks(positions, labels)
+        axis.set_xlim(0, 100)
+        axis.set_title(title, pad=7, fontweight="semibold")
+        axis.set_xlabel("Edited harmful responses (%)")
+        axis.grid(axis="x", color="#e1e7e9", linewidth=0.7)
+        axis.set_axisbelow(True)
+        axis.tick_params(axis="y", length=0)
+        for spine in ("top", "right", "left"):
+            axis.spines[spine].set_visible(False)
+        for position, value, row in zip(positions, values, selected):
+            inside = value > 84
+            axis.text(value - 2 if inside else value + 1.5, position,
+                      f"{row['responses']}/{denominator}", va="center",
+                      ha="right" if inside else "left", fontsize=7,
+                      color="white" if inside else "#40515a")
+    figure.subplots_adjust(left=0.23, right=0.98, bottom=0.20, top=0.88, wspace=0.75)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _plot_steering_paths(pairs, output_path, top_n=6):
+    """Show the most common named source-to-target edit paths."""
+    named_pairs = [pair for pair in pairs if pair["source"].get("name") and pair["target"].get("name")]
+    selected = named_pairs[:top_n]
+    if not selected:
+        return False
+
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Liberation Sans", "Arial", "DejaVu Sans"],
+        "font.size": 8,
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+    })
+    figure, axis = plt.subplots(figsize=(7.2, 0.72 * len(selected) + 1.35))
+    axis.set_xlim(0, 1)
+    axis.set_ylim(-0.5, len(selected) - 0.1)
+    axis.axis("off")
+    axis.text(0.22, len(selected) - 0.25, "Concept triggering edit", ha="center", fontweight="semibold")
+    axis.text(0.78, len(selected) - 0.25, "Selected target", ha="center", fontweight="semibold")
+
+    maximum = max(pair["responses"] for pair in selected)
+    for row_index, pair in enumerate(selected):
+        y = len(selected) - row_index - 1.05
+        source, target = pair["source"], pair["target"]
+        source_color = SAFETY_COLORS[source["safety_label"]]
+        target_color = SAFETY_COLORS[target["safety_label"]]
+        source_name = "\n".join(_wrap_label(source["name"], 30))
+        target_name = "\n".join(_wrap_label(target["name"], 30))
+        axis.text(0.22, y, source_name, ha="center", va="center", fontsize=8,
+                  bbox={"boxstyle": "round,pad=0.45", "facecolor": "white",
+                        "edgecolor": source_color, "linewidth": 1.5})
+        axis.text(0.78, y, target_name, ha="center", va="center", fontsize=8,
+                  bbox={"boxstyle": "round,pad=0.45", "facecolor": "white",
+                        "edgecolor": target_color, "linewidth": 1.5})
+        width = 0.8 + 3.2 * pair["responses"] / maximum
+        axis.annotate("", xy=(0.64, y), xytext=(0.36, y),
+                      arrowprops={"arrowstyle": "-|>", "color": "#60717a", "lw": width,
+                                  "shrinkA": 3, "shrinkB": 3})
+        axis.text(0.50, y + 0.09, f"{pair['responses']} responses", ha="center", va="bottom",
+                  fontsize=7, color="#51636c")
+
+    used_labels = []
+    for pair in selected:
+        for endpoint in (pair["source"], pair["target"]):
+            if endpoint["safety_label"] not in used_labels:
+                used_labels.append(endpoint["safety_label"])
+    handles = [Patch(facecolor="white", edgecolor=SAFETY_COLORS[label], linewidth=1.5,
+                     label=SAFETY_NAMES[label]) for label in used_labels]
+    figure.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.015),
+                  ncol=len(handles), frameon=False, fontsize=7)
+    figure.suptitle("Most frequent named concept edits", y=0.99, fontsize=10)
+    figure.subplots_adjust(left=0.02, right=0.98, bottom=0.13, top=0.88)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
+    return True
+
+
+def _wrap_label(text, width):
+    words, lines, current = text.split(), [], []
+    for word in words:
+        candidate = " ".join(current + [word])
+        if current and len(candidate) > width:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    return lines
+
+
 def analyze_steering(cache_dir, concept_path, result_key, output_dir):
     """Summarize the source and target concepts recorded by a steering run."""
+    # Load the selected steering setting and its concept labels.
     cache_dir, output_dir = Path(cache_dir), Path(output_dir)
     manifest = json.loads((cache_dir / "manifest.json").read_text())
     if manifest.get("format") != "trace_steering_audit_cache":
@@ -502,8 +828,12 @@ def analyze_steering(cache_dir, concept_path, result_key, output_dir):
     pair_counts, pair_responses = Counter(), defaultdict(set)
     source_counts, target_counts = Counter(), Counter()
     source_named = target_named = n_edits = 0
+
+    # Count source concepts, target concepts, and source-to-target pairs across edits.
     for row in selected:
         sources, targets = row["source_code_ids"], row["target_code_ids"]
+        if not (len(row["edit_positions"]) == len(sources) == len(targets)):
+            raise ValueError(f"unaligned steering edits for response {row['response_id']}")
         for source, target in zip(sources, targets):
             pair = (int(source), int(target))
             pair_counts[pair] += 1
@@ -530,14 +860,17 @@ def analyze_steering(cache_dir, concept_path, result_key, output_dir):
             "edits": edits,
         })
 
+    # Summarize event-level and response-level coverage before writing the artifacts.
     output_dir.mkdir(parents=True, exist_ok=True)
-    named_pair_edits = sum(
-        edits for (source, target), edits in pair_counts.items()
-        if _concept_reference(source, catalog).get("name") and _concept_reference(target, catalog).get("name")
-    )
+    named_pair_edits = 0
+    for (source, target), edits in pair_counts.items():
+        source_name = _concept_reference(source, catalog).get("name")
+        target_name = _concept_reference(target, catalog).get("name")
+        if source_name and target_name:
+            named_pair_edits += edits
     groups = {
-        "harmful": _steering_group_summary([row for row in selected if row["label"] == 1], catalog),
-        "safe": _steering_group_summary([row for row in selected if row["label"] == 0], catalog),
+        "harmful": _steering_group_summary([row for row in selected if int(row["label"]) == 1], catalog),
+        "safe": _steering_group_summary([row for row in selected if int(row["label"]) == 0], catalog),
     }
     intervention_records = _response_level_intervention_records(selected, catalog)
     summary = {
@@ -571,6 +904,8 @@ def analyze_steering(cache_dir, concept_path, result_key, output_dir):
         "target_concepts_response_balanced": target_balanced,
         "response_level_intervention_records": intervention_records,
         "top_pairs_file": "steering_concept_pairs.csv",
+        "path_figure_files": ["steering_concept_paths.pdf", "steering_concept_paths.svg"],
+        "role_figure_files": ["steering_concept_roles.pdf", "steering_concept_roles.svg"],
         "intervention_records_file": "steering_intervention_records.csv",
     }
     _json_dump(summary, output_dir / "steering_summary.json")
@@ -598,6 +933,17 @@ def analyze_steering(cache_dir, concept_path, result_key, output_dir):
                 record["response_fraction"], ";".join(map(str, record["response_ids"])),
                 ";".join(f"{source}->{target}" for source, target in record["code_pairs"]),
             ])
+    plot_rows = [
+        {"name": "Concept triggering edit", **source_balanced},
+        {"name": "Selected target concept", **target_balanced},
+    ]
+    _plot_label_bars(plot_rows, output_dir / "steering_concepts.pdf", "Concepts used for steering")
+    _plot_label_bars(plot_rows, output_dir / "steering_concepts.svg", "Concepts used for steering")
+    for extension in ("pdf", "svg"):
+        _plot_steering_paths(top_pairs, output_dir / f"steering_concept_paths.{extension}")
+        _plot_intervention_roles(
+            intervention_records, output_dir / f"steering_concept_roles.{extension}"
+        )
     return summary
 
 
@@ -608,7 +954,7 @@ def parse_args():
     detection = subparsers.add_parser("detection", help="analyze a saved detector token cache")
     detection.add_argument("--cache", required=True)
     detection.add_argument("--concepts", required=True)
-    detection.add_argument("--threshold", default="argmax")
+    detection.add_argument("--threshold", default="fpr05")
     detection.add_argument("--out", required=True)
 
     steering = subparsers.add_parser("steering", help="analyze a saved steering event cache")

@@ -1,10 +1,11 @@
-"""Dataset paths and stratified response splits used by TRACE."""
+"""Dataset paths and response splits used by TRACE."""
 
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-
 import numpy as np
+
+from project_config import DATA_ROOT
 
 
 DEFAULT_DATASET = "wildguard_qwen3_8b"
@@ -14,23 +15,11 @@ WILDGUARD_INTERNLM_DATASET = "wildguard_internlm3_8b_instruct"
 S_EVAL_LLAMA_DATASET = "s_eval_llama_3_1_8b_instruct"
 S_EVAL_INTERNLM_DATASET = "s_eval_internlm3_8b_instruct"
 
-TRAIN_SETS = frozenset({"train", "classifier_train"})
-TEST_SETS = frozenset({"test"})
-
-# Full response pools split 90/10 for detector training and held-out validation.
-DETECTOR_TRAIN_SET_BY_DATASET = {
-    DEFAULT_DATASET: "classifier_train",
-    WILDGUARD_LLAMA_DATASET: "classifier_train",
-    WILDGUARD_INTERNLM_DATASET: "classifier_train",
-    S_EVAL_DATASET: "train",
-    S_EVAL_LLAMA_DATASET: "train",
-    S_EVAL_INTERNLM_DATASET: "train",
-}
-
 
 @dataclass(frozen=True)
 class DatasetSplit:
     name: str
+    kind: str
     source: Path
     max_response_tokens: int
     id_key: str
@@ -38,13 +27,17 @@ class DatasetSplit:
 
 _TRAIN_SPLITS = {
     DEFAULT_DATASET: {
+        "train": ("phase1_vqvae/train_stratified.json", 2048),
         "classifier_train": ("classifier_training/train_deduplicated.jsonl", 2048),
+        "train_small": ("phase1_vqvae/train_balanced_800.json", 1024),
     },
     S_EVAL_DATASET: {"train": ("train.jsonl", 2048)},
     WILDGUARD_LLAMA_DATASET: {
+        "train": ("phase1_vqvae/train_stratified.json", 2048),
         "classifier_train": ("classifier_training/train_deduplicated.jsonl", 2048),
     },
     WILDGUARD_INTERNLM_DATASET: {
+        "train": ("phase1_vqvae/train_stratified.json", 2048),
         "classifier_train": ("classifier_training/train_deduplicated.jsonl", 2048),
     },
     S_EVAL_LLAMA_DATASET: {"train": ("train.jsonl", 2048)},
@@ -63,29 +56,29 @@ _TEST_SPLITS = {
 }
 
 
-def _data_root():
-    from project_config import DATA_ROOT
-
-    return DATA_ROOT
-
-
-def _resolve_split(name, dataset, split_files, id_key):
-    files = split_files[dataset]
-    relative_source, max_response_tokens = files[name]
+def _make_split(name, dataset, kind, split_files, id_key):
+    relative_source, max_response_tokens = split_files[dataset][name]
     return DatasetSplit(
         name=name,
-        source=_data_root() / dataset / relative_source,
+        kind=kind,
+        source=DATA_ROOT / dataset / relative_source,
         max_response_tokens=max_response_tokens,
         id_key=id_key,
     )
 
 
 def training_split(name="train", dataset=DEFAULT_DATASET):
-    return _resolve_split(name, dataset, _TRAIN_SPLITS, "idx")
+    return _make_split(name, dataset, "train", _TRAIN_SPLITS, "idx")
 
 
 def evaluation_split(name="test", dataset=DEFAULT_DATASET):
-    return _resolve_split(name, dataset, _TEST_SPLITS, "test_index")
+    return _make_split(name, dataset, "test", _TEST_SPLITS, "test_index")
+
+
+def dataset_split(name, dataset=DEFAULT_DATASET):
+    if name in _TRAIN_SPLITS[dataset]:
+        return training_split(name, dataset)
+    return evaluation_split(name, dataset)
 
 
 def train_validation_split(sequences, seed, validation_fraction=0.1):

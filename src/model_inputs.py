@@ -1,4 +1,4 @@
-"""Prepare model prompts and variable-length activation batches."""
+"""Shared generator setup, prompt formatting, and activation batching."""
 
 from typing import Optional, TypedDict
 
@@ -7,33 +7,9 @@ import torch
 import transformers.utils
 
 
-@torch.no_grad()
-def initialize_internlm3_rotary_embeddings(model):
-    """Initialize InternLM3 RoPE buffers from the model's own RoPE function.
-
-    Transformers 5 leaves these nonpersistent buffers empty after model loading.
-    """
-    if model.config.model_type != "internlm3":
-        return
-    initialized = 0
-    for module in model.modules():
-        if module.__class__.__name__ != "InternLM3RotaryEmbedding":
-            continue
-        inv_freq, attention_scaling = module.rope_init_fn(
-            module.config, module.inv_freq.device, **module.rope_kwargs
-        )
-        module.register_buffer("inv_freq", inv_freq, persistent=False)
-        module.original_inv_freq = inv_freq
-        module.attention_scaling = attention_scaling
-        module.max_seq_len_cached = module.original_max_seq_len
-        initialized += 1
-    if initialized == 0:
-        raise ValueError("InternLM3 model has no recognized rotary embeddings; check its remote code")
-    print(f"[InternLM] initialized {initialized} RoPE buffers", flush=True)
-
-
-def configure_transformers_compatibility():
-    """Provide the type-only API expected by the InternLM3 model code.
+# Generator compatibility
+def restore_transformers_loss_kwargs():
+    """Restore the type-only API expected by older Hugging Face remote model code.
 
     InternLM3's bundled model implementation targets Transformers 4.47 and imports
     ``LossKwargs`` from ``transformers.utils``. Transformers 5 removed that symbol,
@@ -46,6 +22,42 @@ def configure_transformers_compatibility():
     transformers.utils.LossKwargs = loss_kwargs
 
 
+@torch.no_grad()
+def repair_internlm3_rotary_embeddings(model):
+    """Restore InternLM3's nonpersistent RoPE buffers after model loading.
+
+    Transformers 5 rematerializes these buffers with empty storage. InternLM3's
+    remote-code initializer does not populate them, so we recompute them with the
+    model's own RoPE function.
+    """
+    if getattr(model.config, "model_type", None) != "internlm3":
+        return
+
+    repaired = 0
+    for module in model.modules():
+        if module.__class__.__name__ != "InternLM3RotaryEmbedding":
+            continue
+        if module.inv_freq.device.type == "meta":
+            raise ValueError("InternLM RoPE repair requires a fully materialized model")
+
+        inv_freq, attention_scaling = module.rope_init_fn(
+            module.config, module.inv_freq.device, **module.rope_kwargs
+        )
+        if inv_freq.shape != module.inv_freq.shape or not torch.isfinite(inv_freq).all():
+            raise ValueError("InternLM RoPE initialization returned invalid frequencies")
+
+        module.register_buffer("inv_freq", inv_freq, persistent=False)
+        module.original_inv_freq = inv_freq
+        module.attention_scaling = attention_scaling
+        module.max_seq_len_cached = module.original_max_seq_len
+        repaired += 1
+
+    if repaired == 0:
+        raise ValueError("InternLM3 model has no recognized rotary embeddings; check its remote code")
+    print(f"[InternLM] restored {repaired} RoPE buffers", flush=True)
+
+
+# Prompt formatting
 def format_prompt_token_ids(tokenizer, prompt):
     """Apply the chat template and open an assistant generation turn."""
     messages = [{"role": "user", "content": prompt}]
@@ -58,6 +70,7 @@ def format_prompt_token_ids(tokenizer, prompt):
     return encoded["input_ids"] if hasattr(encoded, "keys") else encoded
 
 
+# Activation batches
 def pad_activation_sequences(sequences, key, device):
     """Right-pad ``[T_i, D]`` tensors into one ``[B, T_max, D]`` batch.
 

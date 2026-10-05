@@ -6,6 +6,7 @@ accelerate==1.13.0
 sentencepiece==0.2.0
 numpy==2.4.2
 pandas==3.0.0
+matplotlib==3.10.8
 pyarrow==23.0.1
 scikit-learn==1.8.0
 optuna==4.9.0
