@@ -2,13 +2,97 @@
 
 import os
 
-import faiss
 import numpy as np
 import torch
 
 MAX_INITIALIZATION_VECTORS = 200_000
 FAISS_ITERATIONS = 20
 FAISS_RESTARTS = 5
+
+# Code-score methods accepted by the training CLI and stored in VQ checkpoints.
+CODE_SCORE_METHODS = ("response_presence", "response_frequency", "token_occurrence")
+
+# The subset of methods that score a code from its per-response enrichment.
+RESPONSE_SCORE_METHODS = ("response_presence", "response_frequency")
+
+# Region-source label recorded in the checkpoint for each score method.
+CODE_SCORE_REGION_SOURCES = {
+    "response_presence": "smoothed_response_enrichment",
+    "response_frequency": "smoothed_response_frequency_enrichment",
+    "token_occurrence": "token_occurrence_enrichment",
+}
+
+# Floor applied to the score normalizers. Without it a partition whose base rate
+# is exactly 0 or 1 divides by zero and yields NaN scores.
+SCORE_DENOMINATOR_FLOOR = 1e-12
+
+
+def _require_faiss():
+    """Import FAISS on demand so the codebook statistics stay importable without it."""
+    try:
+        import faiss
+    except ImportError as error:
+        raise ModuleNotFoundError(
+            "codebook initialization requires faiss-cpu; install it with `pip install faiss-cpu`"
+        ) from error
+    return faiss
+
+
+def _validate_num_codes(num_codes):
+    num_codes = int(num_codes)
+    if num_codes <= 0:
+        raise ValueError(f"num_codes must be positive, got {num_codes}")
+    return num_codes
+
+
+def signed_harmfulness_scores(harmful_probability, base_rate):
+    """Turn a code's harmful probability into a signed enrichment score.
+
+    Positive scores mark codes that fire more often in harmful responses than the
+    partition's base rate, negative scores mark the opposite. Both normalizers are
+    floored so that a degenerate partition (base rate 0 or 1) scores every code 0
+    instead of producing NaN, which would silently blank out the region split.
+    """
+    harmful_probability = np.asarray(harmful_probability, dtype=np.float64)
+    base_rate = float(base_rate)
+    difference_from_base = harmful_probability - base_rate
+    above_base = difference_from_base / max(SCORE_DENOMINATOR_FLOOR, 1.0 - base_rate)
+    below_base = difference_from_base / max(SCORE_DENOMINATOR_FLOOR, base_rate)
+    return np.where(difference_from_base >= 0, above_base, below_base)
+
+
+def code_score_region_source(score_method):
+    """Return the checkpoint region-source label for a score method."""
+    try:
+        return CODE_SCORE_REGION_SOURCES[score_method]
+    except KeyError as error:
+        raise ValueError(
+            f"unknown code score method: {score_method!r}; expected one of {CODE_SCORE_METHODS}"
+        ) from error
+
+
+def code_harmfulness_statistics(
+    score_method, code_sequences, response_labels, num_codes, prior_strength=10.0
+):
+    """Dispatch to the requested code-harmfulness estimator.
+
+    Unknown methods raise instead of silently falling back to token occurrence, which used to
+    train regions with a different estimator than the one recorded in the checkpoint.
+    """
+    if score_method == "response_presence":
+        return smoothed_response_code_statistics(
+            code_sequences, response_labels, num_codes, prior_strength
+        )
+    if score_method == "response_frequency":
+        return smoothed_response_frequency_statistics(
+            code_sequences, response_labels, num_codes, prior_strength
+        )
+    if score_method == "token_occurrence":
+        return token_occurrence_code_statistics(code_sequences, response_labels, num_codes)
+    raise ValueError(
+        f"unknown code score method: {score_method!r}; expected one of {CODE_SCORE_METHODS}"
+    )
+
 
 
 def _flat_float_sequence_activations(sequence, dimension):
@@ -72,6 +156,7 @@ def _set_codebook(model, centroids):
 
 def _spherical_kmeans(vectors, num_clusters, seed):
     """Cluster normalized vectors, then restore each cluster's mean input norm."""
+    faiss = _require_faiss()
     vectors = np.ascontiguousarray(vectors, dtype="float32")
     fit_vectors = vectors / (np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-8)
     fit_vectors = np.ascontiguousarray(fit_vectors, dtype="float32")
@@ -110,7 +195,7 @@ def initialize_codebook_from_sequences(model, training_sequences, seed):
         centroids = _spherical_kmeans(vectors.numpy(), num_codes, seed)
         _set_codebook(model, centroids)
 
-    faiss_max_points_per_centroid = int(faiss.ClusteringParameters().max_points_per_centroid)
+    faiss_max_points_per_centroid = int(_require_faiss().ClusteringParameters().max_points_per_centroid)
     num_faiss_optimization_vectors = min(len(vectors), num_codes * faiss_max_points_per_centroid)
     return {
         "init": "spherical",
@@ -216,6 +301,7 @@ def split_assignments_by_response(sequences, assignments):
 
 def smoothed_response_code_statistics(code_sequences, response_labels, num_codes, prior_strength=10.0):
     """Estimate code harmfulness from response presence, counting each code once per response."""
+    num_codes = _validate_num_codes(num_codes)
     code_sequences = list(code_sequences)
     response_labels = np.asarray(list(response_labels), dtype=np.int8)
     response_counts = np.zeros(num_codes, dtype=np.int64)
@@ -227,16 +313,11 @@ def smoothed_response_code_statistics(code_sequences, response_labels, num_codes
         if label == 1:
             harmful_response_counts[present_codes] += 1
 
-    base_rate = float(response_labels.mean())
+    base_rate = float(response_labels.mean()) if response_labels.size else 0.0
     harmful_probability = (
         harmful_response_counts + prior_strength * base_rate
     ) / (response_counts + prior_strength)
-    difference_from_base = harmful_probability - base_rate
-    signed_harmfulness = np.where(
-        difference_from_base >= 0,
-        difference_from_base / (1 - base_rate),
-        difference_from_base / base_rate,
-    )
+    signed_harmfulness = signed_harmfulness_scores(harmful_probability, base_rate)
     max_count = max(1, int(response_counts.max()))
     normalized_support = np.log1p(response_counts) / np.log1p(max_count)
     return {
@@ -255,6 +336,7 @@ def smoothed_response_code_statistics(code_sequences, response_labels, num_codes
 
 def smoothed_response_frequency_statistics(code_sequences, response_labels, num_codes, prior_strength=10.0):
     """Estimate code harmfulness from per-response code frequencies with unit total response mass."""
+    num_codes = _validate_num_codes(num_codes)
     code_sequences = list(code_sequences)
     response_labels = np.asarray(list(response_labels), dtype=np.int8)
     response_counts = np.zeros(num_codes, dtype=np.int64)
@@ -271,16 +353,11 @@ def smoothed_response_frequency_statistics(code_sequences, response_labels, num_
         if label == 1:
             harmful_response_frequency_mass += frequencies
 
-    base_rate = float(response_labels.mean())
+    base_rate = float(response_labels.mean()) if response_labels.size else 0.0
     harmful_probability = (
         harmful_response_frequency_mass + prior_strength * base_rate
     ) / (response_frequency_mass + prior_strength)
-    difference_from_base = harmful_probability - base_rate
-    signed_harmfulness = np.where(
-        difference_from_base >= 0,
-        difference_from_base / (1 - base_rate),
-        difference_from_base / base_rate,
-    )
+    signed_harmfulness = signed_harmfulness_scores(harmful_probability, base_rate)
     max_count = max(1, int(response_counts.max()))
     normalized_support = np.log1p(response_counts) / np.log1p(max_count)
     return {
@@ -300,6 +377,7 @@ def smoothed_response_frequency_statistics(code_sequences, response_labels, num_
 
 def token_occurrence_code_statistics(code_sequences, response_labels, num_codes):
     """Reproduce the original score: every code occurrence inherits its response label."""
+    num_codes = _validate_num_codes(num_codes)
     code_sequences = [np.asarray(codes, dtype=np.int64).reshape(-1) for codes in code_sequences]
     response_labels = np.asarray(list(response_labels), dtype=np.int8)
     token_counts = np.zeros(num_codes, dtype=np.int64)
@@ -314,17 +392,13 @@ def token_occurrence_code_statistics(code_sequences, response_labels, num_codes)
             total_harmful_tokens += len(codes)
         total_tokens += len(codes)
 
-    base_rate = total_harmful_tokens / total_tokens
+    # An empty partition carries no token base rate, so every code scores as uninformative.
+    base_rate = total_harmful_tokens / total_tokens if total_tokens else 0.0
     harmful_probability = np.divide(
         harmful_token_counts, token_counts,
         out=np.full(num_codes, base_rate, dtype=np.float64), where=token_counts > 0,
     )
-    difference_from_base = harmful_probability - base_rate
-    signed_harmfulness = np.where(
-        difference_from_base >= 0,
-        difference_from_base / max(1e-12, 1 - base_rate),
-        difference_from_base / max(1e-12, base_rate),
-    )
+    signed_harmfulness = signed_harmfulness_scores(harmful_probability, base_rate)
     return {
         "base_harmful_token_rate": float(base_rate),
         "n_tokens": int(total_tokens),

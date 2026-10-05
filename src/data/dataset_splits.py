@@ -57,7 +57,15 @@ _TEST_SPLITS = {
 
 
 def _make_split(name, dataset, kind, split_files, id_key):
-    relative_source, max_response_tokens = split_files[dataset][name]
+    if dataset not in split_files:
+        raise KeyError(f"unknown dataset {dataset!r}; expected one of {sorted(split_files)}")
+    available = split_files[dataset]
+    if name not in available:
+        raise KeyError(
+            f"unknown {kind} split {name!r} for dataset {dataset!r}; "
+            f"available splits: {sorted(available)}"
+        )
+    relative_source, max_response_tokens = available[name]
     return DatasetSplit(
         name=name,
         kind=kind,
@@ -76,6 +84,9 @@ def evaluation_split(name="test", dataset=DEFAULT_DATASET):
 
 
 def dataset_split(name, dataset=DEFAULT_DATASET):
+    """Return the split by name, preferring the training partitions of the dataset."""
+    if dataset not in _TRAIN_SPLITS:
+        raise KeyError(f"unknown dataset {dataset!r}; expected one of {sorted(_TRAIN_SPLITS)}")
     if name in _TRAIN_SPLITS[dataset]:
         return training_split(name, dataset)
     return evaluation_split(name, dataset)

@@ -24,12 +24,12 @@ from data.dataset_splits import (
 from model_inputs import iter_activation_batches, pad_activation_sequences
 from project_config import DEFAULT_BASE_MODEL, MODEL_DIR, READ_LAYER, TARGET_LAYER, VQ_RUNS_DIR
 from vq.codebook import (
+    CODE_SCORE_METHODS,
     assign_codes_for_sequences,
+    code_harmfulness_statistics,
+    code_score_region_source,
     initialize_codebook_from_sequences,
-    smoothed_response_code_statistics,
-    smoothed_response_frequency_statistics,
     split_assignments_by_response,
-    token_occurrence_code_statistics,
 )
 from vq.diagnostics import (
     append_diagnostic_record,
@@ -130,15 +130,9 @@ def compute_code_region_statistics(
     response_assignments, response_labels, num_codes, score_method, prior_strength
 ):
     """Compute the configured harmfulness statistic for every code."""
-    if score_method == "response_presence":
-        return smoothed_response_code_statistics(
-            response_assignments, response_labels, num_codes, prior_strength
-        )
-    if score_method == "response_frequency":
-        return smoothed_response_frequency_statistics(
-            response_assignments, response_labels, num_codes, prior_strength
-        )
-    return token_occurrence_code_statistics(response_assignments, response_labels, num_codes)
+    return code_harmfulness_statistics(
+        score_method, response_assignments, response_labels, num_codes, prior_strength
+    )
 
 
 def derive_code_regions(model, sequences, num_codes, device, score_method, prior_strength):
@@ -349,7 +343,7 @@ def parse_args():
     parser.add_argument("--code-score-prior-strength", type=float, default=10.0,
                         help="response-equivalent prior for smoothed harmful-code region scores")
     parser.add_argument("--region-score-method",
-                        choices=["response_presence", "response_frequency", "token_occurrence"],
+                        choices=list(CODE_SCORE_METHODS),
                         default="response_presence",
                         help="how code occurrences are counted when defining harmful/benign regions")
     parser.add_argument("--region-recompute-every",
@@ -657,11 +651,7 @@ def main():
             if benign_region is not None and harmful_region is not None:
                 benign_idx, harmful_idx = benign_region, harmful_region
                 current_region_statistics = region_statistics
-                current_region_source = {
-                    "response_presence": "smoothed_response_enrichment",
-                    "response_frequency": "smoothed_response_frequency_enrichment",
-                    "token_occurrence": "token_occurrence_enrichment",
-                }[args.region_score_method]
+                current_region_source = code_score_region_source(args.region_score_method)
                 current_region_assignment_space = "encoded_activation"
                 new_harmful_codes = set(harmful_idx.detach().cpu().tolist())
                 current_region_diagnostic = summarize_region_changes(
