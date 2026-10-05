@@ -1,0 +1,33 @@
+dataset: wildguard_internlm3_8b_instruct
+train_set: classifier_train
+activation_cache: output/activations/paper/wildguard_internlm3_8b_instruct/classifier_train
+activation_layer: 34
+vq_run: output/runs/vq/internlm_wildguard
+vq_checkpoint: model_joint.pt
+out: output/runs/detection/internlm_wildguard
+
+input_representation: hybrid
+code_vector_source: activation_mean
+raw_projection_dim: 256
+vq_projection_dim: 256
+hidden_dim: 64
+num_layers: 1
+dropout: 0.05
+code_score_prior_strength: 10.0
+harmfulness_score_weight: 0.75
+
+lr: 0.0000447806536453738
+weight_decay: 0.00001
+streaming_weight: 0.8380231163511671
+response_weight: 1.0
+lr_reduction_factor: 0.5
+lr_patience: 2
+min_lr: 0.000001
+grad_clip: 1.0
+
+selection_metric: mean_ap
+epochs: 30
+batch_size: 16
+code_batch_size: 16
+patience: 6
+seed: 42

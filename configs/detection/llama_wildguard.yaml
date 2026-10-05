@@ -1,0 +1,33 @@
+dataset: wildguard_llama_3_1_8b_instruct
+train_set: classifier_train
+activation_cache: output/activations/paper/wildguard_llama_3_1_8b_instruct/classifier_train
+activation_layer: 14
+vq_run: output/runs/vq/llama_wildguard
+vq_checkpoint: model_joint.pt
+out: output/runs/detection/llama_wildguard
+
+input_representation: hybrid
+code_vector_source: activation_mean
+raw_projection_dim: 256
+vq_projection_dim: 256
+hidden_dim: 64
+num_layers: 1
+dropout: 0.15
+code_score_prior_strength: 10.0
+harmfulness_score_weight: 1.25
+
+lr: 0.00006501380937465894
+weight_decay: 0.01
+streaming_weight: 0.7380082803692899
+response_weight: 1.0
+lr_reduction_factor: 0.5
+lr_patience: 2
+min_lr: 0.000001
+grad_clip: 1.0
+
+selection_metric: mean_ap
+epochs: 30
+batch_size: 16
+code_batch_size: 16
+patience: 6
+seed: 42
