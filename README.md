@@ -2,7 +2,7 @@
 
 This repository contains the implementation of TRACE (Temporal Risk Assessment and Concept Editing). TRACE learns a discrete codebook from language-model activations, uses the learned concepts for streaming harmfulness detection, and steers activations along harmful-to-benign concept directions during generation.
 
-This work was accepted at the [2026 Symposium on Model Accountability, Sustainability and Healthcare (SMASH)](https://smashcon.org/en/). The extended abstract is available [here](Ankur_Garg_SmashCon.pdf).
+This work was accepted at the [2026 Symposium on Model Accountability, Sustainability and Healthcare (SMASH)](https://smashcon.org/en/). The extended abstract is available [here](TRACE.pdf).
 
 ## Repository structure
 
