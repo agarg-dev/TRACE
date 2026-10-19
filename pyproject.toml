@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-harmfulness"
+version = "0.1.0"
+description = "TRACE: Temporal Risk Assessment and Concept Editing for safer language generation"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "Ankur Garg" },
+    { name = "Xuemin Yu" },
+    { name = "Hassan Sajjad" },
+    { name = "Samira Ebrahimi Kahou" },
+]
+keywords = ["interpretability", "activation-steering", "vector-quantization", "harmfulness-detection"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Import-time requirements. The GPU/CUDA build of PyTorch is expected to be installed
+# separately (see requirements.txt) because it is not resolvable from PyPI metadata.
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.2",
+    "transformers>=4.47",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# Needed by the dataset-preparation scripts (src/data).
+data = ["datasets>=3.0", "pandas>=2.0", "pyarrow>=15.0"]
+# Needed by the layer-selection and concept-audit scripts (src/analysis).
+analysis = ["scikit-learn>=1.4", "matplotlib>=3.8", "google-genai>=1.0", "optuna>=4.0"]
+# Only VQ codebook initialization needs FAISS; the codebook statistics do not.
+faiss = ["faiss-cpu>=1.8"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["model_inputs", "project_config"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+# Bug-catching rules only: the research scripts keep a deliberate one-line style that
+# the broader E/C4 sets would churn for no functional gain.
+[tool.ruff.lint]
+select = ["F", "E9"]

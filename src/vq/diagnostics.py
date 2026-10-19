@@ -8,11 +8,11 @@ import numpy as np
 import torch
 
 from vq.codebook import (
+    RESPONSE_SCORE_METHODS,
     assign_codes_for_sequences,
-    smoothed_response_code_statistics,
-    smoothed_response_frequency_statistics,
+    code_harmfulness_statistics,
+    code_score_region_source,
     split_assignments_by_response,
-    token_occurrence_code_statistics,
 )
 
 
@@ -64,18 +64,9 @@ def summarize_initial_codebook(
     assignments = assign_codes_for_sequences(model, training_sequences, device)
     response_assignments = split_assignments_by_response(training_sequences, assignments)
     response_labels = (sequence["label"] for sequence in training_sequences)
-    if score_method == "response_presence":
-        region_statistics = smoothed_response_code_statistics(
-            response_assignments, response_labels, model.quantizer.num_codes, prior_strength
-        )
-    elif score_method == "response_frequency":
-        region_statistics = smoothed_response_frequency_statistics(
-            response_assignments, response_labels, model.quantizer.num_codes, prior_strength
-        )
-    else:
-        region_statistics = token_occurrence_code_statistics(
-            response_assignments, response_labels, model.quantizer.num_codes
-        )
+    region_statistics = code_harmfulness_statistics(
+        score_method, response_assignments, response_labels, model.quantizer.num_codes, prior_strength
+    )
     num_codes = model.quantizer.codebook.shape[0]
     cluster_sizes = np.bincount(assignments, minlength=num_codes)
     harmful_fraction = np.full(num_codes, np.nan)
@@ -118,19 +109,15 @@ def summarize_initial_codebook(
             for representation, _ in Counter(representations).most_common(examples_per_code)
         ]
 
-    if score_method in {"response_presence", "response_frequency"}:
+    if score_method in RESPONSE_SCORE_METHODS:
         base_rate = region_statistics["base_harmful_response_rate"]
         code_harmfulness = region_statistics["smoothed_harmful_probability"]
         base_rate_unit = "responses"
-        region_source = (
-            "smoothed_response_enrichment" if score_method == "response_presence"
-            else "smoothed_response_frequency_enrichment"
-        )
     else:
         base_rate = region_statistics["base_harmful_token_rate"]
         code_harmfulness = region_statistics["harmful_probability"]
         base_rate_unit = "tokens"
-        region_source = "token_occurrence_enrichment"
+    region_source = code_score_region_source(score_method)
     harmful_codes = np.flatnonzero(region_statistics["signed_harmfulness"] > 0).tolist()
     harmful_code_set = set(harmful_codes)
     benign_codes = [code for code in range(num_codes) if code not in harmful_code_set]
@@ -142,7 +129,7 @@ def summarize_initial_codebook(
         "prior_strength": prior_strength,
         "signed_harmfulness": region_statistics["signed_harmfulness"],
     }
-    if score_method in {"response_presence", "response_frequency"}:
+    if score_method in RESPONSE_SCORE_METHODS:
         regions["response_counts"] = region_statistics["response_counts"]
         if score_method == "response_frequency":
             regions["response_frequency_mass"] = region_statistics["response_frequency_mass"]
@@ -176,7 +163,7 @@ def summarize_initial_codebook(
         "base_rate_unit": base_rate_unit,
         "code_score_method": score_method,
         "code_score_prior_strength": (
-            prior_strength if score_method in {"response_presence", "response_frequency"} else None
+            prior_strength if score_method in RESPONSE_SCORE_METHODS else None
         ),
         "n_empty_codes": int((cluster_sizes == 0).sum()),
         "cluster_size_min_med_max": [

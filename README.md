@@ -17,6 +17,7 @@ This work was accepted at the [2026 Symposium on Model Accountability, Sustainab
 │   └── analysis/      # Layer selection and concept audit
 ├── configs/           # Final detector configurations
 ├── src/               # Python implementation
+├── tests/             # Offline test suite
 └── requirements.txt
 ```
 
@@ -134,6 +135,37 @@ bash scripts/analysis/concept_audit.sh
 ```
 
 The paper uses three independently sampled labeling runs with seeds 42, 43, and 44, followed by semantic agreement across the three runs.
+
+## Development
+
+The repository is a flat source tree that is put on the path with `PYTHONPATH=src` by the shell
+scripts. `pyproject.toml` declares the same layout for packaging and for pytest, so the offline test
+suite runs with:
+
+```bash
+python -m pytest
+```
+
+The suite covers the codebook statistics, the vector quantizer and cross-layer VQ-VAE, the activation
+cache loader, dataset splits, prompt/activation batching, the training diagnostics, and the refusal
+rule. It needs only CPU PyTorch, NumPy, and pytest: FAISS, `datasets`, and `matplotlib` are imported
+on demand and are not required to run it.
+
+### Code-score methods
+
+`--region-score-method` selects how a code's harmfulness is estimated from the training partition:
+
+| Method | Meaning |
+|---|---|
+| `response_presence` (default) | each code counts once per response that fires it |
+| `response_frequency` | each response contributes unit total mass, split across its codes |
+| `token_occurrence` | every code occurrence inherits its response label |
+
+Each estimator reports `signed_harmfulness`, the enrichment of a code's harmful rate over the
+partition's base rate, normalized so that `+1` and `-1` are the extremes. Codes scoring above zero
+form the harmful region and the rest form the benign region. When the partition contains only harmful
+(or only safe) responses, every code scores `0` rather than `NaN`, and an unknown method name raises
+instead of silently falling back to a different estimator.
 
 ## Citation
 
