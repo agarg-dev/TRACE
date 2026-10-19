@@ -140,11 +140,10 @@ The paper uses three independently sampled labeling runs with seeds 42, 43, and 
 If you find this work useful or use it in your research, please cite:
 
 ```bibtex
-@misc{garg2026trace,
-  title  = {{TRACE}: Temporal Risk Assessment and Concept Editing for Safer Language Generation},
-  author = {Garg, Ankur and Yu, Xuemin and Sajjad, Hassan and Ebrahimi Kahou, Samira},
-  year   = {2026},
-  note   = {Accepted at the Symposium on Model Accountability, Sustainability and Healthcare (SMASH 2026)},
-  url    = {https://github.com/agarg-dev/TRACE}
+@article{garg2026trace,
+  title={TRACE: Temporal Risk Assessment and Concept Editing for Safer Language Generation},
+  author={Garg, Ankur and Yu, Xuemin and Sajjad, Hassan and Kahou, Samira Ebrahimi},
+  journal={arXiv preprint arXiv:2610.15365},
+  year={2026}
 }
 ```
